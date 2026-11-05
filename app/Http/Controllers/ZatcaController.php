@@ -4,6 +4,7 @@ namespace App\Http\Controllers;
 
 use Illuminate\Http\Request;
 use App\Models\Invoice;
+use App\Models\EgsUnit;
 use ZATCA\EGS;
 use ZATCA\GenerateQrCode;
 use ZATCA\Tags\Seller;
@@ -29,6 +30,114 @@ class ZatcaController extends Controller
     public function getInvoices()
     {
         return response()->json(\App\Models\Invoice::latest()->get());
+    }
+
+    public function getEgsUnit()
+    {
+        $unit = EgsUnit::latest()->first();
+        if (!$unit) {
+            return response()->json([
+                'onboarded' => false,
+                'unit' => null,
+            ]);
+        }
+
+        return response()->json([
+            'onboarded' => true,
+            'unit' => [
+                'id' => $unit->id,
+                'uuid' => $unit->uuid,
+                'custom_id' => $unit->custom_id,
+                'model' => $unit->model,
+                'crn_number' => $unit->crn_number,
+                'vat_name' => $unit->vat_name,
+                'vat_number' => $unit->vat_number,
+                'branch_name' => $unit->branch_name,
+                'branch_industry' => $unit->branch_industry,
+                'location' => $unit->location,
+                'last_icv' => $unit->last_icv,
+                'last_invoice_hash' => $unit->last_invoice_hash,
+                'production' => $unit->production,
+                'status' => $unit->status,
+                'created_at' => $unit->created_at,
+            ],
+        ]);
+    }
+
+    public function onboard(Request $request)
+    {
+        //Log::info("Test");
+        $data = $request->all();
+        $otp = $data['otp'] ?? '266641';
+
+        $egs_unit_data = [
+            'uuid' => $data['seller']['uuid'] ?? EGS::uuid(),
+            'custom_id' => $data['seller']['custom_id'] ?? ('EGS1-' . rand(100000000, 999999999)),
+            'model' => $data['seller']['model'] ?? 'SmartDevice-V1',
+            'CRN_number' => $data['seller']['crn'] ?? '301121971500003',
+            'VAT_name' => $data['seller']['name'] ?? 'Mh Software Solutions',
+            'VAT_number' => $data['seller']['vat_number'] ?? '301121971500003',
+            'location' => [
+                'city' => $data['location']['city'] ?? 'Riyadh',
+                'city_subdivision' => $data['location']['city_subdivision'] ?? 'Olaya',
+                'street' => $data['location']['street'] ?? 'King Fahd Road',
+                'plot_identification' => $data['location']['plot'] ?? '0000',
+                'building' => $data['location']['building'] ?? '2481',
+                'postal_zone' => $data['location']['postal'] ?? '12211',
+            ],
+            'branch_name' => ($data['seller']['name'] ?? 'Mh Software Solutions') . ' Branch',
+            'branch_industry' => 'Retail',
+            'cancelation' => [
+                'cancelation_type' => 'INVOICE',
+                'canceled_invoice_number' => '',
+            ],
+        ];
+
+        try {
+            $egs = new EGS($egs_unit_data);
+            $egs->production = false;
+
+            // 1. Generate private key & CSR
+            list($private_key, $csr) = $egs->generateNewKeysAndCSR('Qr');
+
+            // 2. Request Compliance Certificate from ZATCA using OTP
+            list($request_id, $binary_security_token, $secret) = $egs->issueComplianceCertificate($otp, $csr);
+
+            // 3. Save into egs_units table
+            $unit = EgsUnit::updateOrCreate(
+                ['vat_number' => $egs_unit_data['VAT_number']],
+                [
+                    'uuid' => $egs_unit_data['uuid'],
+                    'custom_id' => $egs_unit_data['custom_id'],
+                    'model' => $egs_unit_data['model'],
+                    'crn_number' => $egs_unit_data['CRN_number'],
+                    'vat_name' => $egs_unit_data['VAT_name'],
+                    'branch_name' => $egs_unit_data['branch_name'],
+                    'branch_industry' => $egs_unit_data['branch_industry'],
+                    'location' => $egs_unit_data['location'],
+                    'private_key' => $private_key,
+                    'certificate' => $binary_security_token,
+                    'secret' => $secret,
+                    'request_id' => $request_id,
+                    'status' => 'onboarded',
+                    'production' => false,
+                ]
+            );
+
+            return response()->json([
+                'success' => true,
+                'message' => 'EGS unit onboarded successfully and certificate saved!',
+                'unit_id' => $unit->id,
+                'uuid' => $unit->uuid,
+                'request_id' => $request_id,
+            ]);
+
+        } catch (\Exception $e) {
+            return response()->json([
+                'success' => false,
+                'message' => $e->getMessage(),
+            ], 500);
+        }
     }
 
     public function downloadXml(\App\Models\Invoice $invoice)
