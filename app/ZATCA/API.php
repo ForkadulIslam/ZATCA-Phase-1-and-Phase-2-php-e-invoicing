@@ -7,8 +7,20 @@ use stdClass;
 
 class API
 {
-    private string $sandbox_url = 'https://gw-fatoora.zatca.gov.sa/e-invoicing/developer-portal';
+    private string $base_url;
     private string $version = 'V2';
+
+    public function __construct(?string $base_url = null)
+    {
+        if ($base_url) {
+            $this->base_url = rtrim($base_url, '/');
+        } elseif (function_exists('config')) {
+            $env = config('zatca.env', 'sandbox');
+            $this->base_url = rtrim(config("zatca.urls.{$env}", 'https://gw-fatoora.zatca.gov.sa/e-invoicing/developer-portal'), '/');
+        } else {
+            $this->base_url = 'https://gw-fatoora.zatca.gov.sa/e-invoicing/developer-portal';
+        }
+    }
 
     private function getAuthHeaders($certificate, $secret): array
     {
@@ -35,7 +47,7 @@ class API
                 'Content-Type: application/json'
             ];
 
-            $curl = curl_init($this->sandbox_url . '/compliance');
+            $curl = curl_init($this->base_url . '/compliance');
 
             curl_setopt_array($curl, array(
                 CURLOPT_RETURNTRANSFER => true,
@@ -69,7 +81,7 @@ class API
                 'Content-Type: application/json',
             ];
 
-            $curl = curl_init($this->sandbox_url . '/compliance/invoices');
+            $curl = curl_init($this->base_url . '/compliance/invoices');
 
             curl_setopt_array($curl, array(
                 CURLOPT_RETURNTRANSFER => true,
@@ -111,7 +123,7 @@ class API
                 'Content-Type: application/json',
             ];
 
-            $curl = curl_init($this->sandbox_url . '/invoices/reporting/single');
+            $curl = curl_init($this->base_url . '/invoices/reporting/single');
 
             curl_setopt_array($curl, array(
                 CURLOPT_RETURNTRANSFER => true,
@@ -146,7 +158,7 @@ class API
                 'Content-Type: application/json',
             ];
 
-            $curl = curl_init($this->sandbox_url . '/invoices/clearance/single');
+            $curl = curl_init($this->base_url . '/invoices/clearance/single');
 
             curl_setopt_array($curl, array(
                 CURLOPT_RETURNTRANSFER => true,

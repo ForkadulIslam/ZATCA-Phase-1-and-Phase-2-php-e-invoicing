@@ -15,6 +15,20 @@ class EGS
     {
         $this->egs_info = $egs_info;
         $this->api = new API();
+        if (function_exists('config')) {
+            $this->production = (bool) config('zatca.is_production', false);
+        }
+    }
+
+    private function getOpenSslPath(): string
+    {
+        if (function_exists('config')) {
+            $path = config('zatca.openssl_path');
+            if (!empty($path)) {
+                return $path;
+            }
+        }
+        return 'openssl';
     }
 
     public function generateNewKeysAndCSR(string $solution_name)
@@ -26,7 +40,8 @@ class EGS
 
     private function generateSecp256k1KeyPair()
     {
-        $cmd = 'D:\\laragon\\bin\\apache\\httpd-2.4.62-240904-win64-VS17\\bin\\openssl.exe ecparam -name secp256k1 -genkey 2>&1';
+        $openssl = $this->getOpenSslPath();
+        $cmd = "\"$openssl\" ecparam -name secp256k1 -genkey 2>&1";
         $result = shell_exec($cmd);
 
         if (empty($result)) {
@@ -65,7 +80,8 @@ class EGS
         fclose($private_key_file);
         fclose($csr_config_file);
 
-        $cmd = "D:\\laragon\\bin\\apache\\httpd-2.4.62-240904-win64-VS17\\bin\\openssl.exe req -new -sha256 -key \"$private_key_file_name\" -config \"$csr_config_file_name\" 2>&1";
+        $openssl = $this->getOpenSslPath();
+        $cmd = "\"$openssl\" req -new -sha256 -key \"$private_key_file_name\" -config \"$csr_config_file_name\" 2>&1";
         $result = shell_exec($cmd);
 
         if (empty($result)) {

@@ -19,6 +19,7 @@ use Endroid\QrCode\Label\Label;
 use Endroid\QrCode\Writer\PngWriter;
 use Endroid\QrCode\Encoding\Encoding;
 use Endroid\QrCode\ErrorCorrectionLevel;
+use Illuminate\Support\Facades\Log;
 
 class ZatcaController extends Controller
 {
@@ -66,7 +67,12 @@ class ZatcaController extends Controller
 
     public function onboard(Request $request)
     {
-        //Log::info("Test");
+        Log::info('ZATCA Onboarding Config Verification', [
+            'env'           => config('zatca.env'),
+            'is_production' => config('zatca.is_production'),
+            'openssl_path'  => config('zatca.openssl_path'),
+            'api_base_url'  => config('zatca.urls.' . config('zatca.env')),
+        ]);
         $data = $request->all();
         $otp = $data['otp'] ?? '266641';
 
@@ -95,7 +101,7 @@ class ZatcaController extends Controller
 
         try {
             $egs = new EGS($egs_unit_data);
-            $egs->production = false;
+            $egs->production = config('zatca.is_production', false);
 
             // 1. Generate private key & CSR
             list($private_key, $csr) = $egs->generateNewKeysAndCSR('Qr');
@@ -240,7 +246,7 @@ class ZatcaController extends Controller
 
         try {
             $egs = new EGS($egs_unit);
-            $egs->production = false;
+            $egs->production = config('zatca.is_production', false);
 
             $egsUnit               = \App\Models\EgsUnit::latest()->first();
             $private_key           = $egsUnit->private_key;
