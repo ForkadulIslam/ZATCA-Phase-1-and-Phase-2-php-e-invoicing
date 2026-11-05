@@ -242,11 +242,10 @@ class ZatcaController extends Controller
             $egs = new EGS($egs_unit);
             $egs->production = false;
 
-            // Generate private key & csr
-            list($private_key, $csr) = $egs->generateNewKeysAndCSR('Qr');
-
-            // Make an request to issue compliance certificate (Using a dummy OTP for testing)
-            list($request_id, $binary_security_token, $secret) = $egs->issueComplianceCertificate('123345', $csr);
+            $egsUnit               = \App\Models\EgsUnit::latest()->first();
+            $private_key           = $egsUnit->private_key;
+            $binary_security_token = $egsUnit->certificate;
+            $secret                = $egsUnit->secret;
 
             // Sign invoice xml
             list($signed_invoice_string, $invoice_hash, $qr) = $egs->signInvoice($invoice, $egs_unit, $binary_security_token, $private_key);
@@ -299,7 +298,7 @@ class ZatcaController extends Controller
                 'invoice_hash' => $invoice_hash,
                 'qr_url' => asset('assets/' . $filename),
                 'compliance' => json_decode($invoiceCompliance),
-                'request_id' => $request_id,
+                'request_id' => '',//$request_id,
                 'invoice_id' => $db_invoice->id
             ]);
 
