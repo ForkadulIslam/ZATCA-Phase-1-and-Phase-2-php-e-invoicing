@@ -24,9 +24,48 @@ class EGS
         return [$private_key, $this->generateCSR($solution_name, $private_key)];
     }
 
+    public static function getOpenSSLBinary(): string
+    {
+        $configuredPath = function_exists('config') ? config('zatca.openssl_path') : null;
+        if (empty($configuredPath)) {
+            $configuredPath = env('ZATCA_OPENSSL_PATH');
+        }
+
+        if (!empty($configuredPath) && self::canExecute($configuredPath)) {
+            return $configuredPath;
+        }
+
+        // On Windows environments, automatically detect working OpenSSL binaries
+        if (strtoupper(substr(PHP_OS, 0, 3)) === 'WIN') {
+            $candidatePaths = [
+                'C:\\laragon\\bin\\laragon\\utils\\openssl\\openssl.exe',
+                'C:\\laragon\\bin\\git\\mingw64\\bin\\openssl.exe',
+            ];
+
+            $apachePaths = glob('C:\\laragon\\bin\\apache\\*\\bin\\openssl.exe') ?: [];
+            $candidatePaths = array_merge($candidatePaths, $apachePaths);
+
+            foreach ($candidatePaths as $path) {
+                if (file_exists($path) && self::canExecute($path)) {
+                    return $path;
+                }
+            }
+        }
+
+        return 'openssl';
+    }
+
+    private static function canExecute(string $binary): bool
+    {
+        $testCmd = '"' . $binary . '" version 2>&1';
+        $output = @shell_exec($testCmd);
+        return !empty($output) && stripos($output, 'OpenSSL') !== false;
+    }
+
     private function generateSecp256k1KeyPair()
     {
-        $cmd = 'D:\\laragon\\bin\\apache\\httpd-2.4.62-240904-win64-VS17\\bin\\openssl.exe ecparam -name secp256k1 -genkey 2>&1';
+        $openssl = self::getOpenSSLBinary();
+        $cmd = '"' . $openssl . '" ecparam -name secp256k1 -genkey 2>&1';
         $result = shell_exec($cmd);
 
         if (empty($result)) {
@@ -65,25 +104,32 @@ class EGS
         fclose($private_key_file);
         fclose($csr_config_file);
 
-        $cmd = "D:\\laragon\\bin\\apache\\httpd-2.4.62-240904-win64-VS17\\bin\\openssl.exe req -new -sha256 -key \"$private_key_file_name\" -config \"$csr_config_file_name\" 2>&1";
-        $result = shell_exec($cmd);
+        try {
+            $openssl = self::getOpenSSLBinary();
+            $cmd = '"' . $openssl . "\" req -new -sha256 -key \"$private_key_file_name\" -config \"$csr_config_file_name\" 2>&1";
+            $result = shell_exec($cmd);
 
-        if (empty($result)) {
-            throw new Exception("OpenSSL command returned empty result. Cmd: $cmd");
+            if (empty($result)) {
+                throw new Exception("OpenSSL command returned empty result. Cmd: $cmd");
+            }
+
+            $parts = explode('-----BEGIN CERTIFICATE REQUEST-----', $result);
+            if (!isset($parts[1])) {
+                throw new Exception("Error generating CSR. OpenSSL output: " . $result . " | Cmd: " . $cmd);
+            }
+            $result = $parts[1];
+
+            $csr = "-----BEGIN CERTIFICATE REQUEST-----$result";
+
+            return $csr;
+        } finally {
+            if (file_exists($private_key_file_name)) {
+                @unlink($private_key_file_name);
+            }
+            if (file_exists($csr_config_file_name)) {
+                @unlink($csr_config_file_name);
+            }
         }
-
-        $parts = explode('-----BEGIN CERTIFICATE REQUEST-----', $result);
-        if (!isset($parts[1])) {
-            throw new Exception("Error generating CSR. OpenSSL output: " . $result . " | Cmd: " . $cmd);
-        }
-        $result = $parts[1];
-
-        $csr = "-----BEGIN CERTIFICATE REQUEST-----$result";
-
-        unlink($private_key_file_name);
-        unlink($csr_config_file_name);
-
-        return $csr;
     }
 
     private function defaultCSRConfig(string $solution_name)
@@ -151,6 +197,13 @@ class EGS
 
         list($issueCertificate, $checkInvoiceCompliance) = $this->api->compliance();
         $issued_data = $issueCertificate($csr, $otp);
+
+        return [$issued_data->requestID, $issued_data->binarySecurityToken, $issued_data->secret];
+    }
+
+    public function issueProductionCertificate(string $compliance_request_id, string $compliance_certificate, string $compliance_secret): array
+    {
+        $issued_data = $this->api->issueProductionCSID($compliance_request_id, $compliance_certificate, $compliance_secret);
 
         return [$issued_data->requestID, $issued_data->binarySecurityToken, $issued_data->secret];
     }

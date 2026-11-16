@@ -7,8 +7,24 @@ use stdClass;
 
 class API
 {
-    private string $sandbox_url = 'https://gw-fatoora.zatca.gov.sa/e-invoicing/developer-portal';
     private string $version = 'V2';
+
+    public function getBaseUrl(): string
+    {
+        $env = function_exists('config') ? config('zatca.environment') : env('ZATCA_ENV', 'developer-portal');
+
+        switch ($env) {
+            case 'core':
+            case 'production':
+                return 'https://gw-fatoora.zatca.gov.sa/e-invoicing/core';
+            case 'simulation':
+                return 'https://gw-fatoora.zatca.gov.sa/e-invoicing/simulation';
+            case 'developer-portal':
+            case 'sandbox':
+            default:
+                return 'https://gw-fatoora.zatca.gov.sa/e-invoicing/developer-portal';
+        }
+    }
 
     private function getAuthHeaders($certificate, $secret): array
     {
@@ -25,6 +41,43 @@ class API
         return [];
     }
 
+    public function issueProductionCSID(string $compliance_request_id, string $compliance_certificate, string $compliance_secret): stdClass
+    {
+        $auth_headers = $this->getAuthHeaders($compliance_certificate, $compliance_secret);
+        $headers = [
+            'Accept-Version: ' . $this->version,
+            'Content-Type: application/json',
+            ...$auth_headers,
+        ];
+
+        $curl = curl_init($this->getBaseUrl() . '/production/csid');
+
+        curl_setopt_array($curl, array(
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_ENCODING => '',
+            CURLOPT_MAXREDIRS => 10,
+            CURLOPT_TIMEOUT => 30,
+            CURLOPT_FOLLOWLOCATION => true,
+            CURLOPT_HTTP_VERSION => CURL_HTTP_VERSION_1_1,
+            CURLOPT_CUSTOMREQUEST => 'POST',
+            CURLOPT_POSTFIELDS => json_encode(['compliance_request_id' => $compliance_request_id]),
+            CURLOPT_HTTPHEADER => $headers,
+        ));
+
+        $response = curl_exec($curl);
+        $http_code = curl_getinfo($curl, CURLINFO_HTTP_CODE);
+        curl_close($curl);
+        $response_data = json_decode($response);
+        if ($http_code != 200) {
+            throw new Exception('Error issuing a production certificate. HTTP: ' . $http_code . ' Response: ' . json_encode($response_data));
+        }
+
+        $issued_certificate = base64_decode($response_data->binarySecurityToken);
+        $response_data->binarySecurityToken = "-----BEGIN CERTIFICATE-----\n{$issued_certificate}\n-----END CERTIFICATE-----";
+
+        return $response_data;
+    }
+
     public function compliance($certificate = NULL, $secret = NULL)
     {
         $auth_headers = $this->getAuthHeaders($certificate, $secret);
@@ -35,7 +88,7 @@ class API
                 'Content-Type: application/json'
             ];
 
-            $curl = curl_init($this->sandbox_url . '/compliance');
+            $curl = curl_init($this->getBaseUrl() . '/compliance');
 
             curl_setopt_array($curl, array(
                 CURLOPT_RETURNTRANSFER => true,
@@ -69,7 +122,7 @@ class API
                 'Content-Type: application/json',
             ];
 
-            $curl = curl_init($this->sandbox_url . '/compliance/invoices');
+            $curl = curl_init($this->getBaseUrl() . '/compliance/invoices');
 
             curl_setopt_array($curl, array(
                 CURLOPT_RETURNTRANSFER => true,
@@ -111,7 +164,7 @@ class API
                 'Content-Type: application/json',
             ];
 
-            $curl = curl_init($this->sandbox_url . '/invoices/reporting/single');
+            $curl = curl_init($this->getBaseUrl() . '/invoices/reporting/single');
 
             curl_setopt_array($curl, array(
                 CURLOPT_RETURNTRANSFER => true,
@@ -146,7 +199,7 @@ class API
                 'Content-Type: application/json',
             ];
 
-            $curl = curl_init($this->sandbox_url . '/invoices/clearance/single');
+            $curl = curl_init($this->getBaseUrl() . '/invoices/clearance/single');
 
             curl_setopt_array($curl, array(
                 CURLOPT_RETURNTRANSFER => true,

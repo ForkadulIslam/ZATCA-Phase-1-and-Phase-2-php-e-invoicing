@@ -4,6 +4,7 @@ namespace App\Http\Controllers;
 
 use Illuminate\Http\Request;
 use App\Models\Invoice;
+use App\Models\EgsUnit;
 use ZATCA\EGS;
 use ZATCA\GenerateQrCode;
 use ZATCA\Tags\Seller;
@@ -201,4 +202,321 @@ class ZatcaController extends Controller
             ], 500);
         }
     }
+
+    public function issueInvoice(Request $request)
+    {
+        $validated = $request->validate([
+            'unit_id' => 'nullable|integer',
+            'unit_uuid' => 'nullable|string',
+            'invoice.number' => 'nullable|string',
+            'invoice.date' => 'nullable|string',
+            'invoice.time' => 'nullable|string',
+            'items' => 'required|array|min:1',
+            'items.*.name' => 'required|string',
+            'items.*.quantity' => 'required|numeric|min:0.01',
+            'items.*.price' => 'required|numeric|min:0',
+            'items.*.vat_percent' => 'nullable|numeric',
+        ]);
+
+        // 1. Locate the onboarded EGS unit
+        $unit = null;
+        if ($request->filled('unit_id')) {
+            $unit = EgsUnit::find($request->input('unit_id'));
+        } elseif ($request->filled('unit_uuid')) {
+            $unit = EgsUnit::where('uuid', $request->input('unit_uuid'))->first();
+        } else {
+            $unit = EgsUnit::latest()->first();
+        }
+
+        if (!$unit) {
+            return response()->json([
+                'success' => false,
+                'message' => 'No onboarded EGS unit found in the database. Please onboard a unit first via POST /api/zatca/onboard.'
+            ], 404);
+        }
+
+        if (empty($unit->certificate) || empty($unit->private_key)) {
+            return response()->json([
+                'success' => false,
+                'message' => 'The selected EGS unit does not have a valid stored certificate or private key.'
+            ], 400);
+        }
+
+        // 2. Automated Sequential Chaining (ICV & PIH)
+        $counter = $unit->current_counter + 1;
+        $previousHash = $unit->last_invoice_hash ?: base64_encode(hash('sha256', '0', true));
+        $invoiceNumber = $request->input('invoice.number') ?? ('INV-' . date('Ymd') . '-' . str_pad($counter, 5, '0', STR_PAD_LEFT));
+        $issueDate = $request->input('invoice.date') ?? date('Y-m-d');
+        $issueTime = $request->input('invoice.time') ?? date('H:i:s');
+
+        // 3. Format line items
+        $items = $request->input('items', []);
+        $lineItems = array_map(function ($index, $item) {
+            return [
+                'id' => (string) ($index + 1),
+                'name' => $item['name'],
+                'quantity' => (float) $item['quantity'],
+                'tax_exclusive_price' => (float) $item['price'],
+                'VAT_percent' => isset($item['vat_percent']) ? (float) $item['vat_percent'] : 0.15,
+                'other_taxes' => $item['other_taxes'] ?? [],
+                'discounts' => $item['discounts'] ?? [],
+            ];
+        }, array_keys($items), $items);
+
+        $invoice = [
+            'invoice_counter_number' => (string) $counter,
+            'invoice_serial_number' => $invoiceNumber,
+            'issue_date' => $issueDate,
+            'issue_time' => $issueTime,
+            'previous_invoice_hash' => $previousHash,
+            'line_items' => $lineItems,
+        ];
+
+        $egs_unit_data = $unit->toEgsArray();
+
+        try {
+            $egs = new EGS($egs_unit_data);
+            $egs->production = $unit->production;
+
+            // 4. Sign invoice using the STORED certificate and private key
+            list($signed_invoice_string, $invoice_hash, $qr) = $egs->signInvoice(
+                $invoice,
+                $egs_unit_data,
+                $unit->certificate,
+                $unit->private_key
+            );
+
+            // 5. Check compliance with ZATCA using the STORED certificate and secret
+            $complianceResults = null;
+            try {
+                $invoiceCompliance = $egs->checkInvoiceCompliance(
+                    $signed_invoice_string,
+                    $invoice_hash,
+                    $unit->certificate,
+                    $unit->secret
+                );
+                $complianceResults = json_decode($invoiceCompliance, true);
+            } catch (\Exception $ce) {
+                $complianceResults = [
+                    'warning' => 'Compliance check note: ' . $ce->getMessage()
+                ];
+            }
+
+            // 6. Generate and save QR Code
+            $qrCode = QrCode::create($qr)
+                ->setEncoding(new Encoding('UTF-8'))
+                ->setErrorCorrectionLevel(ErrorCorrectionLevel::High)
+                ->setSize(300)
+                ->setMargin(10)
+                ->setForegroundColor(new Color(0, 0, 0))
+                ->setBackgroundColor(new Color(255, 255, 255));
+
+            $writer = new PngWriter();
+            $filename = 'phase-2-' . time() . '-' . $counter . '.png';
+            $result = $writer->write($qrCode);
+            $result->saveToFile(public_path('assets/' . $filename));
+
+            // 7. Calculate totals
+            $total_amount = 0;
+            $vat_amount = 0;
+            foreach ($items as $item) {
+                $vatPercent = isset($item['vat_percent']) ? (float) $item['vat_percent'] : 0.15;
+                $subtotal = $item['quantity'] * $item['price'];
+                $total_amount += $subtotal * (1 + $vatPercent);
+                $vat_amount += $subtotal * $vatPercent;
+            }
+
+            // 8. Save invoice to database
+            $db_invoice = Invoice::create([
+                'seller_name' => $unit->vat_name,
+                'vat_number' => $unit->vat_number,
+                'invoice_number' => $invoiceNumber,
+                'issue_date' => $issueDate,
+                'issue_time' => $issueTime,
+                'total_amount' => $total_amount,
+                'vat_amount' => $vat_amount,
+                'invoice_hash' => $invoice_hash,
+                'qr_code' => $qr,
+                'qr_url' => asset('assets/' . $filename),
+                'items_data' => $items,
+                'compliance_results' => $complianceResults,
+                'signed_xml' => $signed_invoice_string,
+            ]);
+
+            // 9. Update EGS unit chain state (ICV & PIH)
+            $unit->current_counter = $counter;
+            $unit->last_invoice_hash = $invoice_hash;
+            $unit->save();
+
+            // 10. If unit was in 'compliance_issued' status, try upgrading to Production CSID
+            if ($unit->status === 'compliance_issued' && !empty($unit->request_id)) {
+                try {
+                    list($prodReqId, $prodToken, $prodSecret) = $egs->issueProductionCertificate(
+                        (string) $unit->request_id,
+                        $unit->certificate,
+                        $unit->secret
+                    );
+                    $unit->certificate = $prodToken;
+                    $unit->secret = $prodSecret;
+                    $unit->request_id = $prodReqId;
+                    $unit->status = 'onboarded';
+                    $unit->save();
+                } catch (\Exception $pe) {
+                    // Still requires further compliance checks; remains compliance_issued
+                }
+            }
+
+            return response()->json([
+                'success' => true,
+                'message' => 'Invoice issued, signed with stored certificate, and chained successfully!',
+                'invoice_id' => $db_invoice->id,
+                'invoice_number' => $invoiceNumber,
+                'invoice_counter' => $counter,
+                'previous_invoice_hash' => $previousHash,
+                'invoice_hash' => $invoice_hash,
+                'qr_url' => asset('assets/' . $filename),
+                'compliance' => $complianceResults,
+                'unit' => [
+                    'id' => $unit->id,
+                    'uuid' => $unit->uuid,
+                    'status' => $unit->status,
+                ],
+            ]);
+
+        } catch (\Exception $e) {
+            return response()->json([
+                'success' => false,
+                'message' => $e->getMessage(),
+            ], 500);
+        }
+    }
+
+    public function onboard(Request $request)
+    {
+        try {
+            $validated = $request->validate([
+                'otp' => 'required|string',
+                'seller.name' => 'required|string',
+                'seller.vat_number' => ['required', 'string', 'regex:/^3\d{13}3$/'],
+                'seller.crn' => 'nullable|string',
+                'seller.custom_id' => 'nullable|string',
+                'seller.model' => 'nullable|string',
+                'location.city' => 'required|string',
+                'location.city_subdivision' => 'nullable|string',
+                'location.street' => 'required|string',
+                'location.building' => 'required|string',
+                'location.postal' => 'required|string',
+                'location.plot' => 'nullable|string',
+            ]);
+
+            $uuid = $request->input('seller.uuid') ?? EGS::uuid();
+            $customId = $request->input('seller.custom_id') ?? ('EGS-' . substr($uuid, 0, 8));
+            $solutionName = config('app.name', 'Smart Invoicing');
+
+            $egs_unit_data = [
+                'uuid' => $uuid,
+                'custom_id' => $customId,
+                'model' => $request->input('seller.model', 'SmartDevice-V1'),
+                'CRN_number' => $request->input('seller.crn', ''),
+                'VAT_name' => $request->input('seller.name'),
+                'VAT_number' => $request->input('seller.vat_number'),
+                'location' => [
+                    'city' => $request->input('location.city'),
+                    'city_subdivision' => $request->input('location.city_subdivision', ''),
+                    'street' => $request->input('location.street'),
+                    'plot_identification' => $request->input('location.plot', '0000'),
+                    'building' => $request->input('location.building'),
+                    'postal_zone' => $request->input('location.postal'),
+                ],
+                'branch_name' => $request->input('seller.name') . ' Branch',
+                'branch_industry' => $request->input('seller.industry', 'Retail'),
+                'cancelation' => [
+                    'cancelation_type' => 'INVOICE',
+                    'canceled_invoice_number' => '',
+                ],
+            ];
+            $isProduction = config('zatca.environment') === 'core' || config('zatca.zatca_is_production', false);
+
+            $egs = new EGS($egs_unit_data);
+            $egs->production = $isProduction;
+
+            // 1. Generate EC Private Key (secp256k1) & CSR
+            list($private_key, $csr) = $egs->generateNewKeysAndCSR($solutionName);
+
+            // 2. Request Compliance Certificate from ZATCA using portal OTP
+            list($complianceRequestId, $complianceToken, $complianceSecret) = $egs->issueComplianceCertificate(
+                $request->input('otp'),
+                $csr
+            );
+
+            // 3. Attempt to issue Production CSID (PCSID)
+            $prodRequestId = null;
+            $productionToken = null;
+            $productionSecret = null;
+            $status = 'compliance_issued';
+
+            try {
+                list($prodRequestId, $productionToken, $productionSecret) = $egs->issueProductionCertificate(
+                    (string) $complianceRequestId,
+                    $complianceToken,
+                    $complianceSecret
+                );
+                $status = 'onboarded';
+            } catch (\Exception $prodException) {
+                // If the environment requires submitting compliance invoices first, keep compliance CSID
+                $status = 'compliance_issued';
+            }
+
+            // 4. Initialize invoice chaining: initial PIH is base64(sha256("0"))
+            $initialPIH = base64_encode(hash('sha256', '0', true));
+
+            // 5. Store unit permanently matched by UUID
+            $unit = EgsUnit::updateOrCreate(
+                ['uuid' => $uuid],
+                [
+                    'custom_id' => $customId,
+                    'model' => $egs_unit_data['model'],
+                    'crn_number' => $egs_unit_data['CRN_number'],
+                    'vat_name' => $egs_unit_data['VAT_name'],
+                    'vat_number' => $egs_unit_data['VAT_number'],
+                    'branch_name' => $egs_unit_data['branch_name'],
+                    'branch_industry' => $egs_unit_data['branch_industry'],
+                    'location' => $egs_unit_data['location'],
+                    'private_key' => $private_key,
+                    'compliance_certificate' => $complianceToken,
+                    'compliance_secret' => $complianceSecret,
+                    'certificate' => $productionToken ?? $complianceToken,
+                    'secret' => $productionSecret ?? $complianceSecret,
+                    'request_id' => $prodRequestId ?? $complianceRequestId,
+                    'status' => $status,
+                    'production' => $isProduction,
+                    'current_counter' => 0,
+                    'last_invoice_hash' => $initialPIH,
+                ]
+            );
+
+            return response()->json([
+                'success' => true,
+                'message' => $status === 'onboarded'
+                    ? 'EGS unit onboarded successfully and Production CSID issued!'
+                    : 'EGS unit registered and Compliance CSID issued (ready for compliance checks).',
+                'status' => $status,
+                'unit_id' => $unit->id,
+                'uuid' => $unit->uuid,
+                'request_id' => $unit->request_id,
+            ]);
+
+        } catch (\Illuminate\Validation\ValidationException $ve) {
+            return response()->json([
+                'success' => false,
+                'errors' => $ve->errors(),
+            ], 422);
+        } catch (\Exception $e) {
+            return response()->json([
+                'success' => false,
+                'message' => $e->getMessage(),
+            ], 500);
+        }
+    }
+
 }
