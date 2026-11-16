@@ -383,6 +383,382 @@ class ZatcaController extends Controller
                 ],
             ]);
 
+        } catch (\Illuminate\Validation\ValidationException $ve) {
+            return response()->json([
+                'success' => false,
+                'errors' => $ve->errors(),
+            ], 422);
+        } catch (\Exception $e) {
+            return response()->json([
+                'success' => false,
+                'message' => $e->getMessage(),
+            ], 500);
+        }
+    }
+
+    public function issueCreditNote(Request $request)
+    {
+        try {
+            $validated = $request->validate([
+            'reference_invoice_number' => 'required|string',
+            'reason' => 'required|string',
+            'payment_method_code' => 'nullable|string',
+            'unit_id' => 'nullable|integer',
+            'unit_uuid' => 'nullable|string',
+            'credit_note.number' => 'nullable|string|unique:invoices,invoice_number',
+            'credit_note.date' => 'nullable|string',
+            'credit_note.time' => 'nullable|string',
+            'items' => 'required|array|min:1',
+            'items.*.name' => 'required|string',
+            'items.*.quantity' => 'required|numeric|min:0.01',
+            'items.*.price' => 'required|numeric|min:0',
+            'items.*.vat_percent' => 'nullable|numeric',
+        ]);
+
+        // 1. Locate the onboarded EGS unit
+        $unit = null;
+        if ($request->filled('unit_id')) {
+            $unit = EgsUnit::find($request->input('unit_id'));
+        } elseif ($request->filled('unit_uuid')) {
+            $unit = EgsUnit::where('uuid', $request->input('unit_uuid'))->first();
+        } else {
+            $unit = EgsUnit::latest()->first();
+        }
+
+        if (!$unit) {
+            return response()->json([
+                'success' => false,
+                'message' => 'No onboarded EGS unit found in the database. Please onboard a unit first via POST /api/zatca/onboard.'
+            ], 404);
+        }
+
+        if (empty($unit->certificate) || empty($unit->private_key)) {
+            return response()->json([
+                'success' => false,
+                'message' => 'The selected EGS unit does not have a valid stored certificate or private key.'
+            ], 400);
+        }
+
+        // 2. Automated Sequential Chaining (ICV & PIH)
+        $counter = $unit->current_counter + 1;
+        $previousHash = $unit->last_invoice_hash ?: base64_encode(hash('sha256', '0', true));
+        $creditNoteNumber = $request->input('credit_note.number') ?? ('CN-' . date('Ymd') . '-' . str_pad($counter, 5, '0', STR_PAD_LEFT));
+        $issueDate = $request->input('credit_note.date') ?? date('Y-m-d');
+        $issueTime = $request->input('credit_note.time') ?? date('H:i:s');
+        $referenceInvoiceNumber = $request->input('reference_invoice_number');
+        $reason = $request->input('reason');
+        $paymentMethodCode = $request->input('payment_method_code', '10');
+
+        // 3. Format line items (must be positive amounts representing credited values)
+        $items = $request->input('items', []);
+        $lineItems = array_map(function ($index, $item) {
+            return [
+                'id' => (string) ($index + 1),
+                'name' => $item['name'],
+                'quantity' => (float) $item['quantity'],
+                'tax_exclusive_price' => (float) $item['price'],
+                'VAT_percent' => isset($item['vat_percent']) ? (float) $item['vat_percent'] : 0.15,
+                'other_taxes' => $item['other_taxes'] ?? [],
+                'discounts' => $item['discounts'] ?? [],
+            ];
+        }, array_keys($items), $items);
+
+        $creditNoteData = [
+            'invoice_counter_number' => (string) $counter,
+            'invoice_serial_number' => $creditNoteNumber,
+            'issue_date' => $issueDate,
+            'issue_time' => $issueTime,
+            'previous_invoice_hash' => $previousHash,
+            'line_items' => $lineItems,
+        ];
+
+        $egs_unit_data = $unit->toEgsArray('CREDIT_NOTE', $referenceInvoiceNumber);
+
+        $egs = new EGS($egs_unit_data);
+        $egs->production = $unit->production;
+
+            // 4. Sign credit note using the STORED certificate and private key
+            list($signed_credit_note_string, $credit_note_hash, $qr) = $egs->signCreditNote(
+                $creditNoteData,
+                $egs_unit_data,
+                $unit->certificate,
+                $unit->private_key,
+                $referenceInvoiceNumber,
+                $reason,
+                $paymentMethodCode
+            );
+
+            // 5. Check compliance with ZATCA using the STORED certificate and secret
+            $complianceResults = null;
+            try {
+                $complianceResponse = $egs->checkInvoiceCompliance(
+                    $signed_credit_note_string,
+                    $credit_note_hash,
+                    $unit->certificate,
+                    $unit->secret
+                );
+                $complianceResults = json_decode($complianceResponse, true);
+            } catch (\Exception $ce) {
+                $complianceResults = [
+                    'warning' => 'Compliance check note: ' . $ce->getMessage()
+                ];
+            }
+            // 6. Generate and save QR Code
+            $qrCode = QrCode::create($qr)
+                ->setEncoding(new Encoding('UTF-8'))
+                ->setErrorCorrectionLevel(ErrorCorrectionLevel::High)
+                ->setSize(300)
+                ->setMargin(10)
+                ->setForegroundColor(new Color(0, 0, 0))
+                ->setBackgroundColor(new Color(255, 255, 255));
+
+            $writer = new PngWriter();
+            $filename = 'credit-note-' . time() . '-' . $counter . '.png';
+            $result = $writer->write($qrCode);
+            $result->saveToFile(public_path('assets/' . $filename));
+
+            // 7. Calculate totals
+            $total_amount = 0;
+            $vat_amount = 0;
+            foreach ($items as $item) {
+                $vatPercent = isset($item['vat_percent']) ? (float) $item['vat_percent'] : 0.15;
+                $subtotal = $item['quantity'] * $item['price'];
+                $total_amount += $subtotal * (1 + $vatPercent);
+                $vat_amount += $subtotal * $vatPercent;
+            }
+
+            // 8. Save credit note to database
+            $db_invoice = Invoice::create([
+                'seller_name' => $unit->vat_name,
+                'vat_number' => $unit->vat_number,
+                'invoice_number' => $creditNoteNumber,
+                'issue_date' => $issueDate,
+                'issue_time' => $issueTime,
+                'total_amount' => $total_amount,
+                'vat_amount' => $vat_amount,
+                'invoice_hash' => $credit_note_hash,
+                'qr_code' => $qr,
+                'qr_url' => asset('assets/' . $filename),
+                'items_data' => $items,
+                'compliance_results' => $complianceResults,
+                'signed_xml' => $signed_credit_note_string,
+            ]);
+
+            // 9. Update EGS unit chain state (ICV & PIH)
+            $unit->current_counter = $counter;
+            $unit->last_invoice_hash = $credit_note_hash;
+            $unit->save();
+
+            return response()->json([
+                'success' => true,
+                'message' => 'Credit note issued, signed with stored certificate, and chained successfully!',
+                'credit_note_id' => $db_invoice->id,
+                'credit_note_number' => $creditNoteNumber,
+                'credit_note_counter' => $counter,
+                'reference_invoice_number' => $referenceInvoiceNumber,
+                'reason' => $reason,
+                'previous_invoice_hash' => $previousHash,
+                'credit_note_hash' => $credit_note_hash,
+                'qr_url' => asset('assets/' . $filename),
+                'compliance' => $complianceResults,
+                'unit' => [
+                    'id' => $unit->id,
+                    'uuid' => $unit->uuid,
+                    'status' => $unit->status,
+                ],
+            ]);
+
+        } catch (\Illuminate\Validation\ValidationException $ve) {
+            return response()->json([
+                'success' => false,
+                'errors' => $ve->errors(),
+            ], 422);
+        } catch (\Exception $e) {
+            return response()->json([
+                'success' => false,
+                'message' => $e->getMessage(),
+            ], 500);
+        }
+    }
+
+    public function issueDebitNote(Request $request)
+    {
+        try {
+            $validated = $request->validate([
+                'reference_invoice_number' => 'required|string',
+                'reason' => 'required|string',
+                'payment_method_code' => 'nullable|string',
+                'unit_id' => 'nullable|integer',
+                'unit_uuid' => 'nullable|string',
+                'debit_note.number' => 'nullable|string|unique:invoices,invoice_number',
+                'debit_note.date' => 'nullable|string',
+                'debit_note.time' => 'nullable|string',
+                'items' => 'required|array|min:1',
+                'items.*.name' => 'required|string',
+                'items.*.quantity' => 'required|numeric|min:0.01',
+                'items.*.price' => 'required|numeric|min:0',
+                'items.*.vat_percent' => 'nullable|numeric',
+            ]);
+
+            // 1. Locate the onboarded EGS unit
+            $unit = null;
+            if ($request->filled('unit_id')) {
+                $unit = EgsUnit::find($request->input('unit_id'));
+            } elseif ($request->filled('unit_uuid')) {
+                $unit = EgsUnit::where('uuid', $request->input('unit_uuid'))->first();
+            } else {
+                $unit = EgsUnit::latest()->first();
+            }
+
+            if (!$unit) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'No onboarded EGS unit found in the database. Please onboard a unit first via POST /api/zatca/onboard.'
+                ], 404);
+            }
+
+            if (empty($unit->certificate) || empty($unit->private_key)) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'The selected EGS unit does not have a valid stored certificate or private key.'
+                ], 400);
+            }
+
+            // 2. Automated Sequential Chaining (ICV & PIH)
+            $counter = $unit->current_counter + 1;
+            $previousHash = $unit->last_invoice_hash ?: base64_encode(hash('sha256', '0', true));
+            $debitNoteNumber = $request->input('debit_note.number') ?? ('DN-' . date('Ymd') . '-' . str_pad($counter, 5, '0', STR_PAD_LEFT));
+            $issueDate = $request->input('debit_note.date') ?? date('Y-m-d');
+            $issueTime = $request->input('debit_note.time') ?? date('H:i:s');
+            $referenceInvoiceNumber = $request->input('reference_invoice_number');
+            $reason = $request->input('reason');
+            $paymentMethodCode = $request->input('payment_method_code', '10');
+
+            // 3. Format line items (must be positive amounts representing debited/additional charges)
+            $items = $request->input('items', []);
+            $lineItems = array_map(function ($index, $item) {
+                return [
+                    'id' => (string) ($index + 1),
+                    'name' => $item['name'],
+                    'quantity' => (float) $item['quantity'],
+                    'tax_exclusive_price' => (float) $item['price'],
+                    'VAT_percent' => isset($item['vat_percent']) ? (float) $item['vat_percent'] : 0.15,
+                    'other_taxes' => $item['other_taxes'] ?? [],
+                    'discounts' => $item['discounts'] ?? [],
+                ];
+            }, array_keys($items), $items);
+
+            $debitNoteData = [
+                'invoice_counter_number' => (string) $counter,
+                'invoice_serial_number' => $debitNoteNumber,
+                'issue_date' => $issueDate,
+                'issue_time' => $issueTime,
+                'previous_invoice_hash' => $previousHash,
+                'line_items' => $lineItems,
+            ];
+
+            $egs_unit_data = $unit->toEgsArray('DEBIT_NOTE', $referenceInvoiceNumber);
+
+            $egs = new EGS($egs_unit_data);
+            $egs->production = $unit->production;
+
+            // 4. Sign debit note using the STORED certificate and private key
+            list($signed_debit_note_string, $debit_note_hash, $qr) = $egs->signDebitNote(
+                $debitNoteData,
+                $egs_unit_data,
+                $unit->certificate,
+                $unit->private_key,
+                $referenceInvoiceNumber,
+                $reason,
+                $paymentMethodCode
+            );
+
+            // 5. Check compliance with ZATCA using the STORED certificate and secret
+            $complianceResults = null;
+            try {
+                $complianceResponse = $egs->checkInvoiceCompliance(
+                    $signed_debit_note_string,
+                    $debit_note_hash,
+                    $unit->certificate,
+                    $unit->secret
+                );
+                $complianceResults = json_decode($complianceResponse, true);
+            } catch (\Exception $ce) {
+                $complianceResults = [
+                    'warning' => 'Compliance check note: ' . $ce->getMessage()
+                ];
+            }
+
+            // 6. Generate and save QR Code
+            $qrCode = QrCode::create($qr)
+                ->setEncoding(new Encoding('UTF-8'))
+                ->setErrorCorrectionLevel(ErrorCorrectionLevel::High)
+                ->setSize(300)
+                ->setMargin(10)
+                ->setForegroundColor(new Color(0, 0, 0))
+                ->setBackgroundColor(new Color(255, 255, 255));
+
+            $writer = new PngWriter();
+            $filename = 'debit-note-' . time() . '-' . $counter . '.png';
+            $result = $writer->write($qrCode);
+            $result->saveToFile(public_path('assets/' . $filename));
+
+            // 7. Calculate totals
+            $total_amount = 0;
+            $vat_amount = 0;
+            foreach ($items as $item) {
+                $vatPercent = isset($item['vat_percent']) ? (float) $item['vat_percent'] : 0.15;
+                $subtotal = $item['quantity'] * $item['price'];
+                $total_amount += $subtotal * (1 + $vatPercent);
+                $vat_amount += $subtotal * $vatPercent;
+            }
+
+            // 8. Save debit note to database
+            $db_invoice = Invoice::create([
+                'seller_name' => $unit->vat_name,
+                'vat_number' => $unit->vat_number,
+                'invoice_number' => $debitNoteNumber,
+                'issue_date' => $issueDate,
+                'issue_time' => $issueTime,
+                'total_amount' => $total_amount,
+                'vat_amount' => $vat_amount,
+                'invoice_hash' => $debit_note_hash,
+                'qr_code' => $qr,
+                'qr_url' => asset('assets/' . $filename),
+                'items_data' => $items,
+                'compliance_results' => $complianceResults,
+                'signed_xml' => $signed_debit_note_string,
+            ]);
+
+            // 9. Update EGS unit chain state (ICV & PIH)
+            $unit->current_counter = $counter;
+            $unit->last_invoice_hash = $debit_note_hash;
+            $unit->save();
+
+            return response()->json([
+                'success' => true,
+                'message' => 'Debit note issued, signed with stored certificate, and chained successfully!',
+                'debit_note_id' => $db_invoice->id,
+                'debit_note_number' => $debitNoteNumber,
+                'debit_note_counter' => $counter,
+                'reference_invoice_number' => $referenceInvoiceNumber,
+                'reason' => $reason,
+                'previous_invoice_hash' => $previousHash,
+                'debit_note_hash' => $debit_note_hash,
+                'qr_url' => asset('assets/' . $filename),
+                'compliance' => $complianceResults,
+                'unit' => [
+                    'id' => $unit->id,
+                    'uuid' => $unit->uuid,
+                    'status' => $unit->status,
+                ],
+            ]);
+
+        } catch (\Illuminate\Validation\ValidationException $ve) {
+            return response()->json([
+                'success' => false,
+                'errors' => $ve->errors(),
+            ], 422);
         } catch (\Exception $e) {
             return response()->json([
                 'success' => false,
@@ -518,5 +894,4 @@ class ZatcaController extends Controller
             ], 500);
         }
     }
-
 }

@@ -14,3 +14,5 @@ Route::get('/api/zatca/invoices/{invoice}/download-xml', [App\Http\Controllers\Z
 
 Route::post('/api/zatca/onboard', [App\Http\Controllers\ZatcaController::class, 'onboard']);
 Route::post('/api/zatca/issue-invoice', [App\Http\Controllers\ZatcaController::class, 'issueInvoice']);
+Route::post('/api/zatca/issue-credit-note', [App\Http\Controllers\ZatcaController::class, 'issueCreditNote']);
+Route::post('/api/zatca/issue-debit-note', [App\Http\Controllers\ZatcaController::class, 'issueDebitNote']);

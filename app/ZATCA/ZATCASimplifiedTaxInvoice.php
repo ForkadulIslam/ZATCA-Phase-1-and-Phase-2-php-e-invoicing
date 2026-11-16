@@ -71,6 +71,90 @@ class ZATCASimplifiedTaxInvoice
         return $document;
     }
 
+    public function simplifiedCreditNote(array $invoice, array $egs_unit, string $referenceInvoiceNumber, string $reason, string $paymentMeansCode = '10')
+    {
+        $populated_template = require app_path('ZATCA/templates/simplified_credit_note_template.php');
+
+        $populated_template = str_replace('SET_BILLING_REFERENCE', $referenceInvoiceNumber, $populated_template);
+        $populated_template = str_replace('SET_PAYMENT_MEANS_CODE', $paymentMeansCode, $populated_template);
+        $populated_template = str_replace('SET_INSTRUCTION_NOTE', htmlspecialchars($reason, ENT_XML1, 'UTF-8'), $populated_template);
+
+        $populated_template = str_replace('SET_INVOICE_SERIAL_NUMBER', $invoice['invoice_serial_number'], $populated_template);
+        $populated_template = str_replace('SET_TERMINAL_UUID', $egs_unit['uuid'], $populated_template);
+        $populated_template = str_replace('SET_ISSUE_DATE', $invoice['issue_date'], $populated_template);
+        $populated_template = str_replace('SET_ISSUE_TIME', $invoice['issue_time'], $populated_template);
+        $populated_template = str_replace('SET_PREVIOUS_INVOICE_HASH', $invoice['previous_invoice_hash'], $populated_template);
+        $populated_template = str_replace('SET_INVOICE_COUNTER_NUMBER', $invoice['invoice_counter_number'], $populated_template);
+
+        if (isset($egs_unit['CRN_number']) && !empty($egs_unit['CRN_number'])) {
+            $crn = $egs_unit['CRN_number'];
+            $scheme = (strlen($crn) === 10 && ctype_digit($crn)) ? 'CRN' : 'OTH';
+            $party_id = "<cac:PartyIdentification><cbc:ID schemeID=\"$scheme\">$crn</cbc:ID></cac:PartyIdentification>";
+            $populated_template = str_replace('SET_PARTY_IDENTIFICATION', $party_id, $populated_template);
+        } else {
+            $populated_template = str_replace('SET_PARTY_IDENTIFICATION', '', $populated_template);
+        }
+
+        $populated_template = str_replace('SET_STREET_NAME', $egs_unit['location']['street'], $populated_template);
+        $populated_template = str_replace('SET_BUILDING_NUMBER', $egs_unit['location']['building'], $populated_template);
+        $populated_template = str_replace('SET_PLOT_IDENTIFICATION', $egs_unit['location']['plot_identification'] ?? '0000', $populated_template);
+        $populated_template = str_replace('SET_CITY_SUBDIVISION', $egs_unit['location']['city_subdivision'] ?? '', $populated_template);
+        $populated_template = str_replace('SET_CITY', $egs_unit['location']['city'], $populated_template);
+        $populated_template = str_replace('SET_POSTAL_NUMBER', $egs_unit['location']['postal_zone'], $populated_template);
+
+        $populated_template = str_replace('SET_VAT_NUMBER', $egs_unit['VAT_number'], $populated_template);
+        $populated_template = str_replace('SET_VAT_NAME', $egs_unit['VAT_name'], $populated_template);
+
+        $parseLineItems = $this->parseLineItems($invoice['line_items']);
+        $populated_template = str_replace('PARSE_LINE_ITEMS', $parseLineItems, $populated_template);
+
+        $document = new DOMDocument();
+        $document->loadXML($populated_template);
+        return $document;
+    }
+
+    public function simplifiedDebitNote(array $invoice, array $egs_unit, string $referenceInvoiceNumber, string $reason, string $paymentMeansCode = '10')
+    {
+        $populated_template = require app_path('ZATCA/templates/simplified_debit_note_template.php');
+
+        $populated_template = str_replace('SET_BILLING_REFERENCE', $referenceInvoiceNumber, $populated_template);
+        $populated_template = str_replace('SET_PAYMENT_MEANS_CODE', $paymentMeansCode, $populated_template);
+        $populated_template = str_replace('SET_INSTRUCTION_NOTE', htmlspecialchars($reason, ENT_XML1, 'UTF-8'), $populated_template);
+
+        $populated_template = str_replace('SET_INVOICE_SERIAL_NUMBER', $invoice['invoice_serial_number'], $populated_template);
+        $populated_template = str_replace('SET_TERMINAL_UUID', $egs_unit['uuid'], $populated_template);
+        $populated_template = str_replace('SET_ISSUE_DATE', $invoice['issue_date'], $populated_template);
+        $populated_template = str_replace('SET_ISSUE_TIME', $invoice['issue_time'], $populated_template);
+        $populated_template = str_replace('SET_PREVIOUS_INVOICE_HASH', $invoice['previous_invoice_hash'], $populated_template);
+        $populated_template = str_replace('SET_INVOICE_COUNTER_NUMBER', $invoice['invoice_counter_number'], $populated_template);
+
+        if (isset($egs_unit['CRN_number']) && !empty($egs_unit['CRN_number'])) {
+            $crn = $egs_unit['CRN_number'];
+            $scheme = (strlen($crn) === 10 && ctype_digit($crn)) ? 'CRN' : 'OTH';
+            $party_id = "<cac:PartyIdentification><cbc:ID schemeID=\"$scheme\">$crn</cbc:ID></cac:PartyIdentification>";
+            $populated_template = str_replace('SET_PARTY_IDENTIFICATION', $party_id, $populated_template);
+        } else {
+            $populated_template = str_replace('SET_PARTY_IDENTIFICATION', '', $populated_template);
+        }
+
+        $populated_template = str_replace('SET_STREET_NAME', $egs_unit['location']['street'], $populated_template);
+        $populated_template = str_replace('SET_BUILDING_NUMBER', $egs_unit['location']['building'], $populated_template);
+        $populated_template = str_replace('SET_PLOT_IDENTIFICATION', $egs_unit['location']['plot_identification'] ?? '0000', $populated_template);
+        $populated_template = str_replace('SET_CITY_SUBDIVISION', $egs_unit['location']['city_subdivision'] ?? '', $populated_template);
+        $populated_template = str_replace('SET_CITY', $egs_unit['location']['city'], $populated_template);
+        $populated_template = str_replace('SET_POSTAL_NUMBER', $egs_unit['location']['postal_zone'], $populated_template);
+
+        $populated_template = str_replace('SET_VAT_NUMBER', $egs_unit['VAT_number'], $populated_template);
+        $populated_template = str_replace('SET_VAT_NAME', $egs_unit['VAT_name'], $populated_template);
+
+        $parseLineItems = $this->parseLineItems($invoice['line_items']);
+        $populated_template = str_replace('PARSE_LINE_ITEMS', $parseLineItems, $populated_template);
+
+        $document = new DOMDocument();
+        $document->loadXML($populated_template);
+        return $document;
+    }
+
     private function defaultBillingReference(string $invoice_number): string
     {
         $populated_template = require app_path('ZATCA/templates/invoice_billing_reference_template.php');
