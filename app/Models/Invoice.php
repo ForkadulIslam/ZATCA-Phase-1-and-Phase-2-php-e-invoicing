@@ -14,6 +14,9 @@ class Invoice extends Model
         'seller_name',
         'vat_number',
         'invoice_number',
+        'invoice_type',
+        'reference_invoice_number',
+        'reason',
         'issue_date',
         'issue_time',
         'total_amount',
@@ -29,5 +32,33 @@ class Invoice extends Model
     protected $casts = [
         'items_data' => 'array',
         'compliance_results' => 'array',
+        'total_amount' => 'decimal:2',
+        'vat_amount' => 'decimal:2',
     ];
+
+    /**
+     * Get the original invoice referenced by this credit/debit note.
+     */
+    public function referenceInvoice()
+    {
+        return $this->belongsTo(Invoice::class, 'reference_invoice_number', 'invoice_number');
+    }
+
+    /**
+     * Get all credit notes issued against this invoice.
+     */
+    public function creditNotes()
+    {
+        return $this->hasMany(Invoice::class, 'reference_invoice_number', 'invoice_number')
+                    ->where('invoice_type', '381');
+    }
+
+    /**
+     * Get all debit notes issued against this invoice.
+     */
+    public function debitNotes()
+    {
+        return $this->hasMany(Invoice::class, 'reference_invoice_number', 'invoice_number')
+                    ->where('invoice_type', '383');
+    }
 }
