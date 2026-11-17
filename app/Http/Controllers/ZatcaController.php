@@ -19,6 +19,7 @@ use Endroid\QrCode\Label\Label;
 use Endroid\QrCode\Writer\PngWriter;
 use Endroid\QrCode\Encoding\Encoding;
 use Endroid\QrCode\ErrorCorrectionLevel;
+use Illuminate\Support\Facades\Log;
 
 class ZatcaController extends Controller
 {
@@ -236,7 +237,6 @@ class ZatcaController extends Controller
             'items.*.price' => 'required|numeric|min:0',
             'items.*.vat_percent' => 'nullable|numeric',
         ]);
-
         // 1. Locate the onboarded EGS unit
         $unit = null;
         if ($request->filled('unit_id')) {
@@ -296,7 +296,7 @@ class ZatcaController extends Controller
         try {
             $egs = new EGS($egs_unit_data);
             $egs->production = $unit->production;
-
+            //Log::info($egs->production);
             // 4. Sign invoice using the STORED certificate and private key
             list($signed_invoice_string, $invoice_hash, $qr) = $egs->signInvoice(
                 $invoice,
@@ -305,19 +305,34 @@ class ZatcaController extends Controller
                 $unit->private_key
             );
 
-            // 5. Check compliance with ZATCA using the STORED certificate and secret
+            // 5. Submit to ZATCA: compliance check or production reporting based on unit status
             $complianceResults = null;
             try {
-                $invoiceCompliance = $egs->checkInvoiceCompliance(
-                    $signed_invoice_string,
-                    $invoice_hash,
-                    $unit->certificate,
-                    $unit->secret
-                );
-                $complianceResults = json_decode($invoiceCompliance, true);
+                if ($unit->status === 'onboarded') {
+                    // Production: report invoice via /invoices/reporting/single
+
+                    $apiResponse = $egs->reportInvoice(
+                        $signed_invoice_string,
+                        $invoice_hash,
+                        $unit->certificate,
+                        $unit->secret
+                    );
+                    Log::info($apiResponse);
+                } else {
+                    // Compliance phase: validate via /compliance/invoices
+                    $apiResponse = $egs->checkInvoiceCompliance(
+                        $signed_invoice_string,
+                        $invoice_hash,
+                        $unit->certificate,
+                        $unit->secret
+                    );
+                }
+                $complianceResults = json_decode($apiResponse, true);
+                
             } catch (\Exception $ce) {
+                Log::info($ce->getMessage());
                 $complianceResults = [
-                    'warning' => 'Compliance check note: ' . $ce->getMessage()
+                    'warning' => 'ZATCA API note: ' . $ce->getMessage()
                 ];
             }
 
@@ -367,24 +382,6 @@ class ZatcaController extends Controller
             $unit->current_counter = $counter;
             $unit->last_invoice_hash = $invoice_hash;
             $unit->save();
-
-            // 10. If unit was in 'compliance_issued' status, try upgrading to Production CSID
-            if ($unit->status === 'compliance_issued' && !empty($unit->request_id)) {
-                try {
-                    list($prodReqId, $prodToken, $prodSecret) = $egs->issueProductionCertificate(
-                        (string) $unit->request_id,
-                        $unit->certificate,
-                        $unit->secret
-                    );
-                    $unit->certificate = $prodToken;
-                    $unit->secret = $prodSecret;
-                    $unit->request_id = $prodReqId;
-                    $unit->status = 'onboarded';
-                    $unit->save();
-                } catch (\Exception $pe) {
-                    // Still requires further compliance checks; remains compliance_issued
-                }
-            }
 
             return response()->json([
                 'success' => true,
@@ -508,19 +505,28 @@ class ZatcaController extends Controller
                 $paymentMethodCode
             );
 
-            // 5. Check compliance with ZATCA using the STORED certificate and secret
+            // 5. Submit to ZATCA: compliance check or production reporting based on unit status
             $complianceResults = null;
             try {
-                $complianceResponse = $egs->checkInvoiceCompliance(
-                    $signed_credit_note_string,
-                    $credit_note_hash,
-                    $unit->certificate,
-                    $unit->secret
-                );
-                $complianceResults = json_decode($complianceResponse, true);
+                if ($unit->status === 'onboarded') {
+                    $apiResponse = $egs->reportInvoice(
+                        $signed_credit_note_string,
+                        $credit_note_hash,
+                        $unit->certificate,
+                        $unit->secret
+                    );
+                } else {
+                    $apiResponse = $egs->checkInvoiceCompliance(
+                        $signed_credit_note_string,
+                        $credit_note_hash,
+                        $unit->certificate,
+                        $unit->secret
+                    );
+                }
+                $complianceResults = json_decode($apiResponse, true);
             } catch (\Exception $ce) {
                 $complianceResults = [
-                    'warning' => 'Compliance check note: ' . $ce->getMessage()
+                    'warning' => 'ZATCA API note: ' . $ce->getMessage()
                 ];
             }
             // 6. Generate and save QR Code
@@ -696,19 +702,28 @@ class ZatcaController extends Controller
                 $paymentMethodCode
             );
 
-            // 5. Check compliance with ZATCA using the STORED certificate and secret
+            // 5. Submit to ZATCA: compliance check or production reporting based on unit status
             $complianceResults = null;
             try {
-                $complianceResponse = $egs->checkInvoiceCompliance(
-                    $signed_debit_note_string,
-                    $debit_note_hash,
-                    $unit->certificate,
-                    $unit->secret
-                );
-                $complianceResults = json_decode($complianceResponse, true);
+                if ($unit->status === 'onboarded') {
+                    $apiResponse = $egs->reportInvoice(
+                        $signed_debit_note_string,
+                        $debit_note_hash,
+                        $unit->certificate,
+                        $unit->secret
+                    );
+                } else {
+                    $apiResponse = $egs->checkInvoiceCompliance(
+                        $signed_debit_note_string,
+                        $debit_note_hash,
+                        $unit->certificate,
+                        $unit->secret
+                    );
+                }
+                $complianceResults = json_decode($apiResponse, true);
             } catch (\Exception $ce) {
                 $complianceResults = [
-                    'warning' => 'Compliance check note: ' . $ce->getMessage()
+                    'warning' => 'ZATCA API note: ' . $ce->getMessage()
                 ];
             }
 
@@ -793,6 +808,100 @@ class ZatcaController extends Controller
         }
     }
 
+    public function requestPcsid(Request $request)
+    {
+        try {
+            $validated = $request->validate([
+                'unit_id'   => 'nullable|integer',
+                'unit_uuid' => 'nullable|string',
+            ]);
+
+            // 1. Locate the EGS unit
+            $unit = null;
+            if ($request->filled('unit_id')) {
+                $unit = EgsUnit::find($request->input('unit_id'));
+            } elseif ($request->filled('unit_uuid')) {
+                $unit = EgsUnit::where('uuid', $request->input('unit_uuid'))->first();
+            } else {
+                $unit = EgsUnit::latest()->first();
+            }
+
+            if (!$unit) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'No EGS unit found. Please onboard a unit first via POST /api/zatca/onboard.',
+                ], 404);
+            }
+
+            // 2. Guard: already fully onboarded?
+            if ($unit->status === 'onboarded') {
+                return response()->json([
+                    'success' => true,
+                    'message' => 'This EGS unit is already onboarded with a Production CSID (PCSID).',
+                    'status'  => $unit->status,
+                    'unit_id' => $unit->id,
+                    'uuid'    => $unit->uuid,
+                ]);
+            }
+
+            // 3. Guard: must have compliance credentials to exchange
+            if (empty($unit->compliance_certificate) || empty($unit->compliance_secret)) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'EGS unit is missing compliance certificate or secret. Re-onboard the unit to generate new compliance credentials.',
+                ], 400);
+            }
+
+            // 4. Guard: must have a compliance request_id
+            if (empty($unit->request_id)) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'No compliance request_id stored for this unit. Re-onboard the unit first.',
+                ], 400);
+            }
+
+            // 5. Build EGS instance and request PCSID
+            $egs_unit_data = $unit->toEgsArray();
+            $egs = new EGS($egs_unit_data);
+            $egs->production = $unit->production;
+
+            list($prodRequestId, $productionToken, $productionSecret) = $egs->issueProductionCertificate(
+                (string) $unit->request_id,
+                $unit->compliance_certificate,
+                $unit->compliance_secret
+            );
+
+            // 6. Upgrade unit credentials and status
+            $unit->certificate  = $productionToken;
+            $unit->secret       = $productionSecret;
+            $unit->request_id   = $prodRequestId;
+            $unit->status       = 'onboarded';
+            $unit->save();
+
+            return response()->json([
+                'success' => true,
+                'message' => 'Production CSID (PCSID) issued successfully! EGS unit is now fully onboarded.',
+                'status'  => $unit->status,
+                'unit_id' => $unit->id,
+                'uuid'    => $unit->uuid,
+                'request_id' => $prodRequestId,
+            ]);
+
+        } catch (\Illuminate\Validation\ValidationException $ve) {
+            return response()->json([
+                'success' => false,
+                'errors'  => $ve->errors(),
+            ], 422);
+        } catch (\Exception $e) {
+            Log::info($e->getMessage());
+            return response()->json([
+                'success' => false,
+                'message' => $e->getMessage(),
+                'hint'    => 'Common reasons: (1) You have not submitted the required 6 compliance invoices yet. (2) The compliance OTP/session has expired — re-onboard the unit. (3) Wrong ZATCA_ENV in .env.',
+            ], 500);
+        }
+    }
+
     public function onboard(Request $request)
     {
         try {
@@ -851,61 +960,49 @@ class ZatcaController extends Controller
                 $csr
             );
 
-            // 3. Attempt to issue Production CSID (PCSID)
-            $prodRequestId = null;
-            $productionToken = null;
-            $productionSecret = null;
-            $status = 'compliance_issued';
-
-            try {
-                list($prodRequestId, $productionToken, $productionSecret) = $egs->issueProductionCertificate(
-                    (string) $complianceRequestId,
-                    $complianceToken,
-                    $complianceSecret
-                );
-                $status = 'onboarded';
-            } catch (\Exception $prodException) {
-                // If the environment requires submitting compliance invoices first, keep compliance CSID
-                $status = 'compliance_issued';
-            }
-
-            // 4. Initialize invoice chaining: initial PIH is base64(sha256("0"))
+            // 3. Initialize invoice chaining: initial PIH is base64(sha256("0"))
             $initialPIH = base64_encode(hash('sha256', '0', true));
 
-            // 5. Store unit permanently matched by UUID
+            // 4. Store unit permanently matched by UUID
+            // Note: certificate/secret are set to compliance credentials here.
+            // Call POST /api/zatca/request-pcsid after submitting 6 compliance invoices
+            // to exchange for the Production CSID (PCSID) and set status = 'onboarded'.
             $unit = EgsUnit::updateOrCreate(
                 ['uuid' => $uuid],
                 [
-                    'custom_id' => $customId,
-                    'model' => $egs_unit_data['model'],
-                    'crn_number' => $egs_unit_data['CRN_number'],
-                    'vat_name' => $egs_unit_data['VAT_name'],
-                    'vat_number' => $egs_unit_data['VAT_number'],
-                    'branch_name' => $egs_unit_data['branch_name'],
-                    'branch_industry' => $egs_unit_data['branch_industry'],
-                    'location' => $egs_unit_data['location'],
-                    'private_key' => $private_key,
+                    'custom_id'              => $customId,
+                    'model'                  => $egs_unit_data['model'],
+                    'crn_number'             => $egs_unit_data['CRN_number'],
+                    'vat_name'               => $egs_unit_data['VAT_name'],
+                    'vat_number'             => $egs_unit_data['VAT_number'],
+                    'branch_name'            => $egs_unit_data['branch_name'],
+                    'branch_industry'        => $egs_unit_data['branch_industry'],
+                    'location'               => $egs_unit_data['location'],
+                    'private_key'            => $private_key,
                     'compliance_certificate' => $complianceToken,
-                    'compliance_secret' => $complianceSecret,
-                    'certificate' => $productionToken ?? $complianceToken,
-                    'secret' => $productionSecret ?? $complianceSecret,
-                    'request_id' => $prodRequestId ?? $complianceRequestId,
-                    'status' => $status,
-                    'production' => $isProduction,
-                    'current_counter' => 0,
-                    'last_invoice_hash' => $initialPIH,
+                    'compliance_secret'      => $complianceSecret,
+                    'certificate'            => $complianceToken,
+                    'secret'                 => $complianceSecret,
+                    'request_id'             => $complianceRequestId,
+                    'status'                 => 'compliance_issued',
+                    'production'             => $isProduction,
+                    'current_counter'        => 0,
+                    'last_invoice_hash'      => $initialPIH,
                 ]
             );
 
             return response()->json([
-                'success' => true,
-                'message' => $status === 'onboarded'
-                    ? 'EGS unit onboarded successfully and Production CSID issued!'
-                    : 'EGS unit registered and Compliance CSID issued (ready for compliance checks).',
-                'status' => $status,
-                'unit_id' => $unit->id,
-                'uuid' => $unit->uuid,
+                'success'    => true,
+                'message'    => 'EGS unit registered and Compliance CSID issued. Submit 6 compliance invoices, then call POST /api/zatca/request-pcsid to obtain the Production CSID.',
+                'status'     => 'compliance_issued',
+                'unit_id'    => $unit->id,
+                'uuid'       => $unit->uuid,
                 'request_id' => $unit->request_id,
+                'next_steps' => [
+                    '1' => 'Submit 6 compliance invoices via /api/zatca/issue-invoice, /api/zatca/issue-credit-note, /api/zatca/issue-debit-note',
+                    '2' => 'Call POST /api/zatca/request-pcsid to exchange compliance CSID for Production CSID',
+                    '3' => 'Unit status will change to "onboarded" and all future invoices will use the production certificate',
+                ],
             ]);
 
         } catch (\Illuminate\Validation\ValidationException $ve) {

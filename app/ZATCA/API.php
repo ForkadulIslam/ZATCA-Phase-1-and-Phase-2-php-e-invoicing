@@ -50,7 +50,7 @@ class API
             ...$auth_headers,
         ];
 
-        $curl = curl_init($this->getBaseUrl() . '/production/csid');
+        $curl = curl_init($this->getBaseUrl() . '/production/csids');
 
         curl_setopt_array($curl, array(
             CURLOPT_RETURNTRANSFER => true,

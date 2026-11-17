@@ -149,8 +149,15 @@ class EGS
 
         $template_csr = require app_path('ZATCA/templates/csr_template.php');
 
+        $env = function_exists('config') ? config('zatca.environment') : env('ZATCA_ENV', 'developer-portal');
+        $templateName = match ($env) {
+            'core', 'production' => 'ZATCA-Code-Signing',
+            'simulation' => 'PREZATCA-Code-Signing',
+            default => 'TSTZATCA-Code-Signing',
+        };
+
         $template_csr = str_replace('SET_PRIVATE_KEY_PASS', ($config['private_key_pass'] ?? 'SET_PRIVATE_KEY_PASS'), $template_csr);
-        $template_csr = str_replace('SET_PRODUCTION_VALUE', ($config['production'] ? 'ZATCA-Code-Signing' : 'TSTZATCA-Code-Signing'), $template_csr);
+        $template_csr = str_replace('SET_PRODUCTION_VALUE', $templateName, $template_csr);
         $template_csr = str_replace('SET_EGS_SERIAL_NUMBER', "1-{$config['solution_name']}|2-{$config['egs_model']}|3-{$config['egs_serial_number']}", $template_csr);
         $template_csr = str_replace('SET_VAT_REGISTRATION_NUMBER', $config['vat_number'], $template_csr);
         $template_csr = str_replace('SET_BRANCH_LOCATION', $config['branch_location'], $template_csr);
@@ -235,20 +242,18 @@ class EGS
         $issue_date = $invoice['issue_date'];
         $issue_time = $invoice['issue_time'];
         $signed_properties_props = [
-            //             'sign_timestamp' => date('Y-m-d\TH:i:s\Z'),
             'sign_timestamp' => date('Y-m-d\TH:i:s', strtotime("{$issue_date} {$issue_time}")),
-            //             'sign_timestamp' => sprintf('%sT%s',$invoice['issue_date'], $invoice['issue_time']),
-//             'sign_timestamp' => '2024-01-14T10:26:49',
             'certificate_hash' => $hash, // SignedSignatureProperties/SigningCertificate/CertDigest/<ds:DigestValue>SET_CERTIFICATE_HASH</ds:DigestValue>
             'certificate_issuer' => $issuer,
             'certificate_serial_number' => $serialNumber
         ];
 
-        $ubl_signature_signed_properties_xml_string_for_signing = $zatca_simplified_tax_invoice->defaultUBLExtensionsSignedPropertiesForSigning($signed_properties_props);
+        $ubl_signature_signed_properties_raw = $zatca_simplified_tax_invoice->defaultUBLExtensionsSignedPropertiesForSigning($signed_properties_props);
+        $doc_sp = new DOMDocument();
+        $doc_sp->loadXML($ubl_signature_signed_properties_raw);
+        $ubl_signature_signed_properties_c14n = $doc_sp->C14N(false, false);
 
-        $ubl_signature_signed_properties_xml_string = $zatca_simplified_tax_invoice->defaultUBLExtensionsSignedProperties($signed_properties_props);
-
-        $signed_properties_hash = base64_encode(openssl_digest($ubl_signature_signed_properties_xml_string_for_signing, 'sha256'));
+        $signed_properties_hash = base64_encode(openssl_digest($ubl_signature_signed_properties_c14n, 'sha256'));
 
         // UBL Extensions
         $ubl_signature_xml_string = $zatca_simplified_tax_invoice->defaultUBLExtensions(
@@ -256,7 +261,7 @@ class EGS
             $signed_properties_hash, // SignatureInformation/Signature/SignedInfo/Reference/<ds:DigestValue>SET_SIGNED_PROPERTIES_HASH</ds:DigestValue>
             $digital_signature,
             $certificate,
-            $ubl_signature_signed_properties_xml_string
+            $ubl_signature_signed_properties_c14n
         );
 
         // Set signing elements
@@ -317,16 +322,19 @@ class EGS
             'certificate_serial_number' => $serialNumber
         ];
 
-        $ubl_signature_signed_properties_xml_string_for_signing = $zatca_simplified_tax_invoice->defaultUBLExtensionsSignedPropertiesForSigning($signed_properties_props);
-        $ubl_signature_signed_properties_xml_string = $zatca_simplified_tax_invoice->defaultUBLExtensionsSignedProperties($signed_properties_props);
-        $signed_properties_hash = base64_encode(openssl_digest($ubl_signature_signed_properties_xml_string_for_signing, 'sha256'));
+        $ubl_signature_signed_properties_raw = $zatca_simplified_tax_invoice->defaultUBLExtensionsSignedPropertiesForSigning($signed_properties_props);
+        $doc_sp = new DOMDocument();
+        $doc_sp->loadXML($ubl_signature_signed_properties_raw);
+        $ubl_signature_signed_properties_c14n = $doc_sp->C14N(false, false);
+
+        $signed_properties_hash = base64_encode(openssl_digest($ubl_signature_signed_properties_c14n, 'sha256'));
 
         $ubl_signature_xml_string = $zatca_simplified_tax_invoice->defaultUBLExtensions(
             $invoice_hash,
             $signed_properties_hash,
             $digital_signature,
             $certificate,
-            $ubl_signature_signed_properties_xml_string
+            $ubl_signature_signed_properties_c14n
         );
 
         $unsigned_invoice_str = $invoice_xml->saveXML();
@@ -383,16 +391,19 @@ class EGS
             'certificate_serial_number' => $serialNumber
         ];
 
-        $ubl_signature_signed_properties_xml_string_for_signing = $zatca_simplified_tax_invoice->defaultUBLExtensionsSignedPropertiesForSigning($signed_properties_props);
-        $ubl_signature_signed_properties_xml_string = $zatca_simplified_tax_invoice->defaultUBLExtensionsSignedProperties($signed_properties_props);
-        $signed_properties_hash = base64_encode(openssl_digest($ubl_signature_signed_properties_xml_string_for_signing, 'sha256'));
+        $ubl_signature_signed_properties_raw = $zatca_simplified_tax_invoice->defaultUBLExtensionsSignedPropertiesForSigning($signed_properties_props);
+        $doc_sp = new DOMDocument();
+        $doc_sp->loadXML($ubl_signature_signed_properties_raw);
+        $ubl_signature_signed_properties_c14n = $doc_sp->C14N(false, false);
+
+        $signed_properties_hash = base64_encode(openssl_digest($ubl_signature_signed_properties_c14n, 'sha256'));
 
         $ubl_signature_xml_string = $zatca_simplified_tax_invoice->defaultUBLExtensions(
             $invoice_hash,
             $signed_properties_hash,
             $digital_signature,
             $certificate,
-            $ubl_signature_signed_properties_xml_string
+            $ubl_signature_signed_properties_c14n
         );
 
         $unsigned_invoice_str = $invoice_xml->saveXML();

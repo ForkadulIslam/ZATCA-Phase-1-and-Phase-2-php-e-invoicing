@@ -16,3 +16,4 @@ Route::post('/api/zatca/onboard', [App\Http\Controllers\ZatcaController::class, 
 Route::post('/api/zatca/issue-invoice', [App\Http\Controllers\ZatcaController::class, 'issueInvoice']);
 Route::post('/api/zatca/issue-credit-note', [App\Http\Controllers\ZatcaController::class, 'issueCreditNote']);
 Route::post('/api/zatca/issue-debit-note', [App\Http\Controllers\ZatcaController::class, 'issueDebitNote']);
+Route::post('/api/zatca/request-pcsid', [App\Http\Controllers\ZatcaController::class, 'requestPcsid']);
