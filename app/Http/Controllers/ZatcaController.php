@@ -27,9 +27,28 @@ class ZatcaController extends Controller
         return view('welcome');
     }
 
-    public function getInvoices()
+    public function getInvoices(Request $request)
     {
-        return response()->json(\App\Models\Invoice::latest()->get());
+        $query = \App\Models\Invoice::with(['creditNotes', 'debitNotes', 'referenceInvoice'])->latest();
+
+        if ($request->filled('type')) {
+            $query->where('invoice_type', $request->input('type'));
+        }
+
+        if ($request->filled('reference')) {
+            $query->where('reference_invoice_number', $request->input('reference'));
+        }
+
+        if ($request->filled('search')) {
+            $search = $request->input('search');
+            $query->where(function ($q) use ($search) {
+                $q->where('invoice_number', 'like', "%{$search}%")
+                  ->orWhere('reference_invoice_number', 'like', "%{$search}%")
+                  ->orWhere('seller_name', 'like', "%{$search}%");
+            });
+        }
+
+        return response()->json($query->get());
     }
 
     public function downloadXml(\App\Models\Invoice $invoice)
