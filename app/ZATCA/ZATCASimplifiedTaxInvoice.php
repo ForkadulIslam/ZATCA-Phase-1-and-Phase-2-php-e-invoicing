@@ -212,9 +212,22 @@ class ZATCASimplifiedTaxInvoice
 
         $public_key = str_replace(['-----BEGIN PUBLIC KEY-----', '-----END PUBLIC KEY-----'], '', $cert['key']);
 
+        // Build issuer DN correctly, handling multi-value fields (e.g. DC = ['local','gov','extgazt'])
+        $issuerParts = [];
+        foreach (array_reverse((array) $x509['issuer']) as $key => $value) {
+            if (is_array($value)) {
+                foreach ($value as $v) {
+                    $issuerParts[] = $key . '=' . $v;
+                }
+            } else {
+                $issuerParts[] = $key . '=' . $value;
+            }
+        }
+        $issuerDN = implode(', ', $issuerParts);
+
         return [
             $hash,
-            'CN=' . implode(', ', array_reverse((array) $x509['issuer'])),
+            $issuerDN,
             $x509['serialNumber'],
             base64_decode($public_key),
             $this->getCertificateSignature($wrapped_certificate_string),

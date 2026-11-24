@@ -328,7 +328,7 @@ class ZatcaController extends Controller
                     );
                 }
                 $complianceResults = json_decode($apiResponse, true);
-                
+
             } catch (\Exception $ce) {
                 Log::info($ce->getMessage());
                 $complianceResults = [
@@ -392,6 +392,7 @@ class ZatcaController extends Controller
                 'previous_invoice_hash' => $previousHash,
                 'invoice_hash' => $invoice_hash,
                 'qr_url' => asset('assets/' . $filename),
+                'qr_code' => $qr,
                 'compliance' => $complianceResults,
                 'unit' => [
                     'id' => $unit->id,
@@ -589,6 +590,7 @@ class ZatcaController extends Controller
                 'previous_invoice_hash' => $previousHash,
                 'credit_note_hash' => $credit_note_hash,
                 'qr_url' => asset('assets/' . $filename),
+                'qr_code' => $qr,
                 'compliance' => $complianceResults,
                 'unit' => [
                     'id' => $unit->id,
@@ -787,6 +789,7 @@ class ZatcaController extends Controller
                 'previous_invoice_hash' => $previousHash,
                 'debit_note_hash' => $debit_note_hash,
                 'qr_url' => asset('assets/' . $filename),
+                'qr_code' => $qr,
                 'compliance' => $complianceResults,
                 'unit' => [
                     'id' => $unit->id,
