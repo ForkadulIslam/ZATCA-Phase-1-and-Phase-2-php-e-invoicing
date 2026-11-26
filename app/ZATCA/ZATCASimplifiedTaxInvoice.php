@@ -113,6 +113,146 @@ class ZATCASimplifiedTaxInvoice
         return $document;
     }
 
+    /**
+     * Standard Credit Note (B2B) — type code 381, name="0100000"
+     * Requires buyer (AccountingCustomerParty) details.
+     * Submitted via /invoices/clearance/single.
+     */
+    public function standardCreditNote(array $invoice, array $egs_unit, array $buyer, string $referenceInvoiceNumber, string $reason, string $paymentMeansCode = '10')
+    {
+        $populated_template = require app_path('ZATCA/templates/standard_credit_note_template.php');
+
+        $populated_template = str_replace('SET_BILLING_REFERENCE',   $referenceInvoiceNumber,                              $populated_template);
+        $populated_template = str_replace('SET_PAYMENT_MEANS_CODE',  $paymentMeansCode,                                    $populated_template);
+        $populated_template = str_replace('SET_INSTRUCTION_NOTE',    htmlspecialchars($reason, ENT_XML1, 'UTF-8'),          $populated_template);
+        $populated_template = str_replace('SET_INVOICE_SERIAL_NUMBER', $invoice['invoice_serial_number'],                   $populated_template);
+        $populated_template = str_replace('SET_TERMINAL_UUID',       $egs_unit['uuid'],                                    $populated_template);
+        $populated_template = str_replace('SET_ISSUE_DATE',          $invoice['issue_date'],                               $populated_template);
+        $populated_template = str_replace('SET_ISSUE_TIME',          $invoice['issue_time'],                               $populated_template);
+        $populated_template = str_replace('SET_PREVIOUS_INVOICE_HASH', $invoice['previous_invoice_hash'],                  $populated_template);
+        $populated_template = str_replace('SET_INVOICE_COUNTER_NUMBER', $invoice['invoice_counter_number'],                 $populated_template);
+
+        // Supplier party identification
+        if (isset($egs_unit['CRN_number']) && !empty($egs_unit['CRN_number'])) {
+            $crn    = $egs_unit['CRN_number'];
+            $scheme = (strlen($crn) === 10 && ctype_digit($crn)) ? 'CRN' : 'OTH';
+            $party_id = "<cac:PartyIdentification><cbc:ID schemeID=\"$scheme\">$crn</cbc:ID></cac:PartyIdentification>";
+            $populated_template = str_replace('SET_PARTY_IDENTIFICATION', $party_id, $populated_template);
+        } else {
+            $populated_template = str_replace('SET_PARTY_IDENTIFICATION', '', $populated_template);
+        }
+
+        // Supplier address
+        $populated_template = str_replace('SET_STREET_NAME',         $egs_unit['location']['street'],                      $populated_template);
+        $populated_template = str_replace('SET_BUILDING_NUMBER',     $egs_unit['location']['building'],                    $populated_template);
+        $populated_template = str_replace('SET_PLOT_IDENTIFICATION', $egs_unit['location']['plot_identification'] ?? '0000', $populated_template);
+        $populated_template = str_replace('SET_CITY_SUBDIVISION',    $egs_unit['location']['city_subdivision'] ?? '',       $populated_template);
+        $populated_template = str_replace('SET_CITY',                $egs_unit['location']['city'],                        $populated_template);
+        $populated_template = str_replace('SET_POSTAL_NUMBER',       $egs_unit['location']['postal_zone'],                 $populated_template);
+        $populated_template = str_replace('SET_VAT_NUMBER',          $egs_unit['VAT_number'],                              $populated_template);
+        $populated_template = str_replace('SET_VAT_NAME',            $egs_unit['VAT_name'],                                $populated_template);
+
+        // Buyer party identification (BT-46: Other Buyer ID like CRN, not VAT which is in PartyTaxScheme)
+        if (!empty($buyer['crn'])) {
+            $scheme = (strlen($buyer['crn']) === 10 && ctype_digit($buyer['crn'])) ? 'CRN' : 'OTH';
+            $buyer_party_id = "<cac:PartyIdentification><cbc:ID schemeID=\"$scheme\">{$buyer['crn']}</cbc:ID></cac:PartyIdentification>";
+            $populated_template = str_replace('SET_BUYER_PARTY_IDENTIFICATION', $buyer_party_id, $populated_template);
+        } elseif (!empty($buyer['other_id']) && !empty($buyer['other_id_scheme'])) {
+            $buyer_party_id = "<cac:PartyIdentification><cbc:ID schemeID=\"{$buyer['other_id_scheme']}\">{$buyer['other_id']}</cbc:ID></cac:PartyIdentification>";
+            $populated_template = str_replace('SET_BUYER_PARTY_IDENTIFICATION', $buyer_party_id, $populated_template);
+        } else {
+            $populated_template = str_replace('SET_BUYER_PARTY_IDENTIFICATION', '', $populated_template);
+        }
+
+        // Buyer address
+        $populated_template = str_replace('SET_BUYER_STREET_NAME',        $buyer['street']           ?? '', $populated_template);
+        $populated_template = str_replace('SET_BUYER_BUILDING_NUMBER',    $buyer['building']         ?? '', $populated_template);
+        $populated_template = str_replace('SET_BUYER_PLOT_IDENTIFICATION', $buyer['plot']            ?? '0000', $populated_template);
+        $populated_template = str_replace('SET_BUYER_CITY_SUBDIVISION',   $buyer['city_subdivision'] ?? '', $populated_template);
+        $populated_template = str_replace('SET_BUYER_CITY',               $buyer['city']             ?? '', $populated_template);
+        $populated_template = str_replace('SET_BUYER_POSTAL_NUMBER',      $buyer['postal']           ?? '', $populated_template);
+        $populated_template = str_replace('SET_BUYER_VAT_NUMBER',         $buyer['vat_number']       ?? '', $populated_template);
+        $populated_template = str_replace('SET_BUYER_VAT_NAME',           $buyer['name']             ?? '', $populated_template);
+
+        // Line items
+        $parseLineItems = $this->parseLineItems($invoice['line_items']);
+        $populated_template = str_replace('PARSE_LINE_ITEMS', $parseLineItems, $populated_template);
+
+        $document = new DOMDocument();
+        $document->loadXML($populated_template);
+        return $document;
+    }
+
+    /**
+     * Standard Debit Note (B2B) — type code 383, name="0100000"
+     * Requires buyer (AccountingCustomerParty) details.
+     * Submitted via /invoices/clearance/single.
+     */
+    public function standardDebitNote(array $invoice, array $egs_unit, array $buyer, string $referenceInvoiceNumber, string $reason, string $paymentMeansCode = '10')
+    {
+        $populated_template = require app_path('ZATCA/templates/standard_debit_note_template.php');
+
+        $populated_template = str_replace('SET_BILLING_REFERENCE',   $referenceInvoiceNumber,                              $populated_template);
+        $populated_template = str_replace('SET_PAYMENT_MEANS_CODE',  $paymentMeansCode,                                    $populated_template);
+        $populated_template = str_replace('SET_INSTRUCTION_NOTE',    htmlspecialchars($reason, ENT_XML1, 'UTF-8'),          $populated_template);
+        $populated_template = str_replace('SET_INVOICE_SERIAL_NUMBER', $invoice['invoice_serial_number'],                   $populated_template);
+        $populated_template = str_replace('SET_TERMINAL_UUID',       $egs_unit['uuid'],                                    $populated_template);
+        $populated_template = str_replace('SET_ISSUE_DATE',          $invoice['issue_date'],                               $populated_template);
+        $populated_template = str_replace('SET_ISSUE_TIME',          $invoice['issue_time'],                               $populated_template);
+        $populated_template = str_replace('SET_PREVIOUS_INVOICE_HASH', $invoice['previous_invoice_hash'],                  $populated_template);
+        $populated_template = str_replace('SET_INVOICE_COUNTER_NUMBER', $invoice['invoice_counter_number'],                 $populated_template);
+
+        // Supplier party identification
+        if (isset($egs_unit['CRN_number']) && !empty($egs_unit['CRN_number'])) {
+            $crn    = $egs_unit['CRN_number'];
+            $scheme = (strlen($crn) === 10 && ctype_digit($crn)) ? 'CRN' : 'OTH';
+            $party_id = "<cac:PartyIdentification><cbc:ID schemeID=\"$scheme\">$crn</cbc:ID></cac:PartyIdentification>";
+            $populated_template = str_replace('SET_PARTY_IDENTIFICATION', $party_id, $populated_template);
+        } else {
+            $populated_template = str_replace('SET_PARTY_IDENTIFICATION', '', $populated_template);
+        }
+
+        // Supplier address
+        $populated_template = str_replace('SET_STREET_NAME',         $egs_unit['location']['street'],                      $populated_template);
+        $populated_template = str_replace('SET_BUILDING_NUMBER',     $egs_unit['location']['building'],                    $populated_template);
+        $populated_template = str_replace('SET_PLOT_IDENTIFICATION', $egs_unit['location']['plot_identification'] ?? '0000', $populated_template);
+        $populated_template = str_replace('SET_CITY_SUBDIVISION',    $egs_unit['location']['city_subdivision'] ?? '',       $populated_template);
+        $populated_template = str_replace('SET_CITY',                $egs_unit['location']['city'],                        $populated_template);
+        $populated_template = str_replace('SET_POSTAL_NUMBER',       $egs_unit['location']['postal_zone'],                 $populated_template);
+        $populated_template = str_replace('SET_VAT_NUMBER',          $egs_unit['VAT_number'],                              $populated_template);
+        $populated_template = str_replace('SET_VAT_NAME',            $egs_unit['VAT_name'],                                $populated_template);
+
+        // Buyer party identification (BT-46: Other Buyer ID like CRN, not VAT which is in PartyTaxScheme)
+        if (!empty($buyer['crn'])) {
+            $scheme = (strlen($buyer['crn']) === 10 && ctype_digit($buyer['crn'])) ? 'CRN' : 'OTH';
+            $buyer_party_id = "<cac:PartyIdentification><cbc:ID schemeID=\"$scheme\">{$buyer['crn']}</cbc:ID></cac:PartyIdentification>";
+            $populated_template = str_replace('SET_BUYER_PARTY_IDENTIFICATION', $buyer_party_id, $populated_template);
+        } elseif (!empty($buyer['other_id']) && !empty($buyer['other_id_scheme'])) {
+            $buyer_party_id = "<cac:PartyIdentification><cbc:ID schemeID=\"{$buyer['other_id_scheme']}\">{$buyer['other_id']}</cbc:ID></cac:PartyIdentification>";
+            $populated_template = str_replace('SET_BUYER_PARTY_IDENTIFICATION', $buyer_party_id, $populated_template);
+        } else {
+            $populated_template = str_replace('SET_BUYER_PARTY_IDENTIFICATION', '', $populated_template);
+        }
+
+        // Buyer address
+        $populated_template = str_replace('SET_BUYER_STREET_NAME',        $buyer['street']           ?? '', $populated_template);
+        $populated_template = str_replace('SET_BUYER_BUILDING_NUMBER',    $buyer['building']         ?? '', $populated_template);
+        $populated_template = str_replace('SET_BUYER_PLOT_IDENTIFICATION', $buyer['plot']            ?? '0000', $populated_template);
+        $populated_template = str_replace('SET_BUYER_CITY_SUBDIVISION',   $buyer['city_subdivision'] ?? '', $populated_template);
+        $populated_template = str_replace('SET_BUYER_CITY',               $buyer['city']             ?? '', $populated_template);
+        $populated_template = str_replace('SET_BUYER_POSTAL_NUMBER',      $buyer['postal']           ?? '', $populated_template);
+        $populated_template = str_replace('SET_BUYER_VAT_NUMBER',         $buyer['vat_number']       ?? '', $populated_template);
+        $populated_template = str_replace('SET_BUYER_VAT_NAME',           $buyer['name']             ?? '', $populated_template);
+
+        // Line items
+        $parseLineItems = $this->parseLineItems($invoice['line_items']);
+        $populated_template = str_replace('PARSE_LINE_ITEMS', $parseLineItems, $populated_template);
+
+        $document = new DOMDocument();
+        $document->loadXML($populated_template);
+        return $document;
+    }
+
     public function simplifiedDebitNote(array $invoice, array $egs_unit, string $referenceInvoiceNumber, string $reason, string $paymentMeansCode = '10')
     {
         $populated_template = require app_path('ZATCA/templates/simplified_debit_note_template.php');
@@ -147,6 +287,84 @@ class ZATCASimplifiedTaxInvoice
         $populated_template = str_replace('SET_VAT_NUMBER', $egs_unit['VAT_number'], $populated_template);
         $populated_template = str_replace('SET_VAT_NAME', $egs_unit['VAT_name'], $populated_template);
 
+        $parseLineItems = $this->parseLineItems($invoice['line_items']);
+        $populated_template = str_replace('PARSE_LINE_ITEMS', $parseLineItems, $populated_template);
+
+        $document = new DOMDocument();
+        $document->loadXML($populated_template);
+        return $document;
+    }
+
+    /**
+     * Standard Tax Invoice (B2B) — type code 388, name="0100000"
+     * Requires buyer (AccountingCustomerParty) details.
+     * Submitted via /invoices/clearance/single.
+     */
+    public function standardTaxInvoice(array $invoice, array $egs_unit, array $buyer)
+    {
+        $populated_template = require app_path('ZATCA/templates/standard_tax_invoice_template.php');
+
+        // Billing reference (for cancellation/credit scenarios)
+        if (isset($egs_unit['cancelation']['canceled_invoice_number']) && $egs_unit['cancelation']['canceled_invoice_number']) {
+            $populated_template = str_replace('SET_BILLING_REFERENCE', $this->defaultBillingReference($egs_unit['cancelation']['canceled_invoice_number']), $populated_template);
+        } else {
+            $populated_template = str_replace('SET_BILLING_REFERENCE', '', $populated_template);
+        }
+
+        $populated_template = str_replace('SET_INVOICE_SERIAL_NUMBER', $invoice['invoice_serial_number'], $populated_template);
+        $populated_template = str_replace('SET_TERMINAL_UUID', $egs_unit['uuid'], $populated_template);
+        $populated_template = str_replace('SET_ISSUE_DATE', $invoice['issue_date'], $populated_template);
+        $populated_template = str_replace('SET_ISSUE_TIME', $invoice['issue_time'], $populated_template);
+        $populated_template = str_replace('SET_PREVIOUS_INVOICE_HASH', $invoice['previous_invoice_hash'], $populated_template);
+        $populated_template = str_replace('SET_INVOICE_COUNTER_NUMBER', $invoice['invoice_counter_number'], $populated_template);
+
+        // Supplier party identification
+        if (isset($egs_unit['CRN_number']) && !empty($egs_unit['CRN_number'])) {
+            $crn    = $egs_unit['CRN_number'];
+            $scheme = (strlen($crn) === 10 && ctype_digit($crn)) ? 'CRN' : 'OTH';
+            $party_id = "<cac:PartyIdentification><cbc:ID schemeID=\"$scheme\">$crn</cbc:ID></cac:PartyIdentification>";
+            $populated_template = str_replace('SET_PARTY_IDENTIFICATION', $party_id, $populated_template);
+        } else {
+            $populated_template = str_replace('SET_PARTY_IDENTIFICATION', '', $populated_template);
+        }
+
+        // Supplier address
+        $populated_template = str_replace('SET_STREET_NAME',       $egs_unit['location']['street'],              $populated_template);
+        $populated_template = str_replace('SET_BUILDING_NUMBER',   $egs_unit['location']['building'],            $populated_template);
+        $populated_template = str_replace('SET_PLOT_IDENTIFICATION', $egs_unit['location']['plot_identification'] ?? '0000', $populated_template);
+        $populated_template = str_replace('SET_CITY_SUBDIVISION',  $egs_unit['location']['city_subdivision'] ?? '', $populated_template);
+        $populated_template = str_replace('SET_CITY',              $egs_unit['location']['city'],                $populated_template);
+        $populated_template = str_replace('SET_POSTAL_NUMBER',     $egs_unit['location']['postal_zone'],         $populated_template);
+        $populated_template = str_replace('SET_VAT_NUMBER',        $egs_unit['VAT_number'],                     $populated_template);
+        $populated_template = str_replace('SET_VAT_NAME',          $egs_unit['VAT_name'],                       $populated_template);
+
+        // Supply date (KSA-5: required for Standard Tax Invoices)
+        $supplyDate = $invoice['supply_date'] ?? $invoice['issue_date'];
+        $populated_template = str_replace('SET_SUPPLY_DATE', $supplyDate, $populated_template);
+
+        // Buyer party identification (BT-46: Other Buyer ID like CRN, not VAT which is in PartyTaxScheme)
+        if (!empty($buyer['crn'])) {
+            $scheme = (strlen($buyer['crn']) === 10 && ctype_digit($buyer['crn'])) ? 'CRN' : 'OTH';
+            $buyer_party_id = "<cac:PartyIdentification><cbc:ID schemeID=\"$scheme\">{$buyer['crn']}</cbc:ID></cac:PartyIdentification>";
+            $populated_template = str_replace('SET_BUYER_PARTY_IDENTIFICATION', $buyer_party_id, $populated_template);
+        } elseif (!empty($buyer['other_id']) && !empty($buyer['other_id_scheme'])) {
+            $buyer_party_id = "<cac:PartyIdentification><cbc:ID schemeID=\"{$buyer['other_id_scheme']}\">{$buyer['other_id']}</cbc:ID></cac:PartyIdentification>";
+            $populated_template = str_replace('SET_BUYER_PARTY_IDENTIFICATION', $buyer_party_id, $populated_template);
+        } else {
+            $populated_template = str_replace('SET_BUYER_PARTY_IDENTIFICATION', '', $populated_template);
+        }
+
+        // Buyer address
+        $populated_template = str_replace('SET_BUYER_STREET_NAME',       $buyer['street']           ?? '', $populated_template);
+        $populated_template = str_replace('SET_BUYER_BUILDING_NUMBER',   $buyer['building']         ?? '', $populated_template);
+        $populated_template = str_replace('SET_BUYER_PLOT_IDENTIFICATION', $buyer['plot']            ?? '0000', $populated_template);
+        $populated_template = str_replace('SET_BUYER_CITY_SUBDIVISION',  $buyer['city_subdivision'] ?? '', $populated_template);
+        $populated_template = str_replace('SET_BUYER_CITY',              $buyer['city']             ?? '', $populated_template);
+        $populated_template = str_replace('SET_BUYER_POSTAL_NUMBER',     $buyer['postal']           ?? '', $populated_template);
+        $populated_template = str_replace('SET_BUYER_VAT_NUMBER',        $buyer['vat_number']       ?? '', $populated_template);
+        $populated_template = str_replace('SET_BUYER_VAT_NAME',          $buyer['name']             ?? '', $populated_template);
+
+        // Line items
         $parseLineItems = $this->parseLineItems($invoice['line_items']);
         $populated_template = str_replace('PARSE_LINE_ITEMS', $parseLineItems, $populated_template);
 
@@ -212,11 +430,11 @@ class ZATCASimplifiedTaxInvoice
 
         $public_key = str_replace(['-----BEGIN PUBLIC KEY-----', '-----END PUBLIC KEY-----'], '', $cert['key']);
 
-        // Build issuer DN correctly, handling multi-value fields (e.g. DC = ['local','gov','extgazt'])
+        // Build issuer DN correctly in RFC 2253 order (reverse both outer RDNs and multi-value arrays)
         $issuerParts = [];
         foreach (array_reverse((array) $x509['issuer']) as $key => $value) {
             if (is_array($value)) {
-                foreach ($value as $v) {
+                foreach (array_reverse($value) as $v) {
                     $issuerParts[] = $key . '=' . $v;
                 }
             } else {
@@ -225,13 +443,46 @@ class ZATCASimplifiedTaxInvoice
         }
         $issuerDN = implode(', ', $issuerParts);
 
+        // Convert hex serial number (e.g. "0x5B00...") to decimal integer string for XSD xsd:integer compliance
+        $serialNumber = (string) $x509['serialNumber'];
+        if (stripos($serialNumber, '0x') === 0) {
+            $serialNumber = $this->hexToDec(substr($serialNumber, 2));
+        } elseif (!ctype_digit($serialNumber) && !empty($x509['serialNumberHex'])) {
+            $serialNumber = $this->hexToDec($x509['serialNumberHex']);
+        }
+
         return [
             $hash,
             $issuerDN,
-            $x509['serialNumber'],
+            $serialNumber,
             base64_decode($public_key),
             $this->getCertificateSignature($wrapped_certificate_string),
         ];
+    }
+
+    private function hexToDec(string $hex): string
+    {
+        $dec = '0';
+        $hex = ltrim(strtolower($hex), '0');
+        if ($hex === '') {
+            return '0';
+        }
+        $len = strlen($hex);
+        for ($i = 0; $i < $len; $i++) {
+            $carry = hexdec($hex[$i]);
+            $newDec = '';
+            for ($j = strlen($dec) - 1; $j >= 0; $j--) {
+                $val = ((int) $dec[$j]) * 16 + $carry;
+                $newDec = ($val % 10) . $newDec;
+                $carry = intdiv($val, 10);
+            }
+            while ($carry > 0) {
+                $newDec = ($carry % 10) . $newDec;
+                $carry = intdiv($carry, 10);
+            }
+            $dec = $newDec;
+        }
+        return $dec;
     }
 
     public function getCertificateSignature(string $cer): string

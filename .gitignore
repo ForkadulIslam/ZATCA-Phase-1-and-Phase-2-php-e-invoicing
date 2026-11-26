@@ -16,6 +16,7 @@
 /public/assets/phase-*.png
 /public/assets/debit-*.png
 /public/assets/credit-*.png
+/public/assets/standard-*.png
 !/public/assets/.gitkeep
 !/public/assets/logo.png
 /public/build

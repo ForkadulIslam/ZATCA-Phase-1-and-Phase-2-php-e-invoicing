@@ -215,6 +215,63 @@ class EGS
         return [$issued_data->requestID, $issued_data->binarySecurityToken, $issued_data->secret];
     }
 
+    // 2b. Standard Tax Invoice (B2B) — uses clearance endpoint
+    public function signStandardInvoice(array $invoice, array $egs_unit, array $buyer, string $certificate, string $private_key): array
+    {
+        $zatca_simplified_tax_invoice = new ZATCASimplifiedTaxInvoice();
+
+        $invoice_xml = $zatca_simplified_tax_invoice->standardTaxInvoice($invoice, $egs_unit, $buyer);
+
+        $invoice_hash = $zatca_simplified_tax_invoice->getInvoiceHash($invoice_xml);
+
+        list($hash, $issuer, $serialNumber, $public_key, $signature)
+            = $zatca_simplified_tax_invoice->getCertificateInfo($certificate);
+
+        $digital_signature = $zatca_simplified_tax_invoice->createInvoiceDigitalSignature($invoice_hash, $private_key);
+
+        $qr = $zatca_simplified_tax_invoice->generateQR(
+            $invoice_xml,
+            $digital_signature,
+            $public_key,
+            $signature,
+            $invoice_hash
+        );
+
+        $issue_date = $invoice['issue_date'];
+        $issue_time = $invoice['issue_time'];
+        $signed_properties_props = [
+            'sign_timestamp'          => date('Y-m-d\TH:i:s', strtotime("{$issue_date} {$issue_time}")),
+            'certificate_hash'        => $hash,
+            'certificate_issuer'      => $issuer,
+            'certificate_serial_number' => $serialNumber
+        ];
+
+        $ubl_signature_signed_properties_raw = $zatca_simplified_tax_invoice->defaultUBLExtensionsSignedPropertiesForSigning($signed_properties_props);
+        $doc_sp = new DOMDocument();
+        $doc_sp->loadXML($ubl_signature_signed_properties_raw);
+        $ubl_signature_signed_properties_c14n = $doc_sp->C14N(false, false);
+
+        $signed_properties_hash = base64_encode(openssl_digest($ubl_signature_signed_properties_c14n, 'sha256'));
+
+        $ubl_signature_xml_string = $zatca_simplified_tax_invoice->defaultUBLExtensions(
+            $invoice_hash,
+            $signed_properties_hash,
+            $digital_signature,
+            $certificate,
+            $ubl_signature_signed_properties_c14n
+        );
+
+        $unsigned_invoice_str = $invoice_xml->saveXML();
+        $unsigned_invoice_str = str_replace('SET_UBL_EXTENSIONS_STRING', $ubl_signature_xml_string, $unsigned_invoice_str);
+        $unsigned_invoice_str = str_replace('SET_QR_CODE_DATA', $qr, $unsigned_invoice_str);
+
+        $signed_invoice = new DOMDocument();
+        $signed_invoice->loadXML($unsigned_invoice_str);
+        $signed_invoice_string = $signed_invoice->saveXML();
+
+        return [$signed_invoice_string, $invoice_hash, $qr];
+    }
+
     // 2.
     public function signInvoice(array $invoice, array $egs_unit, string $certificate, string $private_key): array
     {
@@ -275,6 +332,150 @@ class EGS
 
         $signed_invoice_string = $signed_invoice->saveXML();
         //$signed_invoice_string = $zatca_simplified_tax_invoice->signedPropertiesIndentationFix($signed_invoice_string);
+
+        return [$signed_invoice_string, $invoice_hash, $qr];
+    }
+
+    // 2b (credit note). Standard Credit Note (B2B) — uses clearance endpoint
+    public function signStandardCreditNote(
+        array $invoice,
+        array $egs_unit,
+        array $buyer,
+        string $certificate,
+        string $private_key,
+        string $referenceInvoiceNumber,
+        string $reason,
+        string $paymentMeansCode = '10'
+    ): array {
+        $zatca_simplified_tax_invoice = new ZATCASimplifiedTaxInvoice();
+
+        $invoice_xml = $zatca_simplified_tax_invoice->standardCreditNote(
+            $invoice,
+            $egs_unit,
+            $buyer,
+            $referenceInvoiceNumber,
+            $reason,
+            $paymentMeansCode
+        );
+
+        $invoice_hash = $zatca_simplified_tax_invoice->getInvoiceHash($invoice_xml);
+
+        list($hash, $issuer, $serialNumber, $public_key, $signature)
+            = $zatca_simplified_tax_invoice->getCertificateInfo($certificate);
+
+        $digital_signature = $zatca_simplified_tax_invoice->createInvoiceDigitalSignature($invoice_hash, $private_key);
+
+        $qr = $zatca_simplified_tax_invoice->generateQR(
+            $invoice_xml,
+            $digital_signature,
+            $public_key,
+            $signature,
+            $invoice_hash
+        );
+
+        $issue_date = $invoice['issue_date'];
+        $issue_time = $invoice['issue_time'];
+        $signed_properties_props = [
+            'sign_timestamp'            => date('Y-m-d\TH:i:s', strtotime("{$issue_date} {$issue_time}")),
+            'certificate_hash'          => $hash,
+            'certificate_issuer'        => $issuer,
+            'certificate_serial_number' => $serialNumber,
+        ];
+
+        $ubl_signature_signed_properties_raw = $zatca_simplified_tax_invoice->defaultUBLExtensionsSignedPropertiesForSigning($signed_properties_props);
+        $doc_sp = new DOMDocument();
+        $doc_sp->loadXML($ubl_signature_signed_properties_raw);
+        $ubl_signature_signed_properties_c14n = $doc_sp->C14N(false, false);
+
+        $signed_properties_hash = base64_encode(openssl_digest($ubl_signature_signed_properties_c14n, 'sha256'));
+
+        $ubl_signature_xml_string = $zatca_simplified_tax_invoice->defaultUBLExtensions(
+            $invoice_hash,
+            $signed_properties_hash,
+            $digital_signature,
+            $certificate,
+            $ubl_signature_signed_properties_c14n
+        );
+
+        $unsigned_invoice_str = $invoice_xml->saveXML();
+        $unsigned_invoice_str = str_replace('SET_UBL_EXTENSIONS_STRING', $ubl_signature_xml_string, $unsigned_invoice_str);
+        $unsigned_invoice_str = str_replace('SET_QR_CODE_DATA', $qr, $unsigned_invoice_str);
+
+        $signed_invoice = new DOMDocument();
+        $signed_invoice->loadXML($unsigned_invoice_str);
+        $signed_invoice_string = $signed_invoice->saveXML();
+
+        return [$signed_invoice_string, $invoice_hash, $qr];
+    }
+
+    // 2b (debit note). Standard Debit Note (B2B) — uses clearance endpoint
+    public function signStandardDebitNote(
+        array $invoice,
+        array $egs_unit,
+        array $buyer,
+        string $certificate,
+        string $private_key,
+        string $referenceInvoiceNumber,
+        string $reason,
+        string $paymentMeansCode = '10'
+    ): array {
+        $zatca_simplified_tax_invoice = new ZATCASimplifiedTaxInvoice();
+
+        $invoice_xml = $zatca_simplified_tax_invoice->standardDebitNote(
+            $invoice,
+            $egs_unit,
+            $buyer,
+            $referenceInvoiceNumber,
+            $reason,
+            $paymentMeansCode
+        );
+
+        $invoice_hash = $zatca_simplified_tax_invoice->getInvoiceHash($invoice_xml);
+
+        list($hash, $issuer, $serialNumber, $public_key, $signature)
+            = $zatca_simplified_tax_invoice->getCertificateInfo($certificate);
+
+        $digital_signature = $zatca_simplified_tax_invoice->createInvoiceDigitalSignature($invoice_hash, $private_key);
+
+        $qr = $zatca_simplified_tax_invoice->generateQR(
+            $invoice_xml,
+            $digital_signature,
+            $public_key,
+            $signature,
+            $invoice_hash
+        );
+
+        $issue_date = $invoice['issue_date'];
+        $issue_time = $invoice['issue_time'];
+        $signed_properties_props = [
+            'sign_timestamp'            => date('Y-m-d\TH:i:s', strtotime("{$issue_date} {$issue_time}")),
+            'certificate_hash'          => $hash,
+            'certificate_issuer'        => $issuer,
+            'certificate_serial_number' => $serialNumber,
+        ];
+
+        $ubl_signature_signed_properties_raw = $zatca_simplified_tax_invoice->defaultUBLExtensionsSignedPropertiesForSigning($signed_properties_props);
+        $doc_sp = new DOMDocument();
+        $doc_sp->loadXML($ubl_signature_signed_properties_raw);
+        $ubl_signature_signed_properties_c14n = $doc_sp->C14N(false, false);
+
+        $signed_properties_hash = base64_encode(openssl_digest($ubl_signature_signed_properties_c14n, 'sha256'));
+
+        $ubl_signature_xml_string = $zatca_simplified_tax_invoice->defaultUBLExtensions(
+            $invoice_hash,
+            $signed_properties_hash,
+            $digital_signature,
+            $certificate,
+            $ubl_signature_signed_properties_c14n
+        );
+
+        $unsigned_invoice_str = $invoice_xml->saveXML();
+        $unsigned_invoice_str = str_replace('SET_UBL_EXTENSIONS_STRING', $ubl_signature_xml_string, $unsigned_invoice_str);
+        $unsigned_invoice_str = str_replace('SET_QR_CODE_DATA', $qr, $unsigned_invoice_str);
+
+        $signed_invoice = new DOMDocument();
+        $signed_invoice->loadXML($unsigned_invoice_str);
+        $signed_invoice_string = $signed_invoice->saveXML();
 
         return [$signed_invoice_string, $invoice_hash, $qr];
     }

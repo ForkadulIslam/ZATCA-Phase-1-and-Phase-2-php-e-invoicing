@@ -20,6 +20,7 @@ use Endroid\QrCode\Writer\PngWriter;
 use Endroid\QrCode\Encoding\Encoding;
 use Endroid\QrCode\ErrorCorrectionLevel;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Validator;
 
 class ZatcaController extends Controller
 {
@@ -223,80 +224,364 @@ class ZatcaController extends Controller
         }
     }
 
-    public function issueInvoice(Request $request)
+    public function issueStandardInvoice(Request $request)
     {
-        $validated = $request->validate([
-            'unit_id' => 'nullable|integer',
-            'unit_uuid' => 'nullable|string',
-            'invoice.number' => 'nullable|string',
-            'invoice.date' => 'nullable|string',
-            'invoice.time' => 'nullable|string',
-            'items' => 'required|array|min:1',
-            'items.*.name' => 'required|string',
-            'items.*.quantity' => 'required|numeric|min:0.01',
-            'items.*.price' => 'required|numeric|min:0',
-            'items.*.vat_percent' => 'nullable|numeric',
-        ]);
-        // 1. Locate the onboarded EGS unit
-        $unit = null;
-        if ($request->filled('unit_id')) {
-            $unit = EgsUnit::find($request->input('unit_id'));
-        } elseif ($request->filled('unit_uuid')) {
-            $unit = EgsUnit::where('uuid', $request->input('unit_uuid'))->first();
-        } else {
-            $unit = EgsUnit::latest()->first();
-        }
-
-        if (!$unit) {
-            return response()->json([
-                'success' => false,
-                'message' => 'No onboarded EGS unit found in the database. Please onboard a unit first via POST /api/zatca/onboard.'
-            ], 404);
-        }
-
-        if (empty($unit->certificate) || empty($unit->private_key)) {
-            return response()->json([
-                'success' => false,
-                'message' => 'The selected EGS unit does not have a valid stored certificate or private key.'
-            ], 400);
-        }
-
-        // 2. Automated Sequential Chaining (ICV & PIH)
-        $counter = $unit->current_counter + 1;
-        $previousHash = $unit->last_invoice_hash ?: base64_encode(hash('sha256', '0', true));
-        $invoiceNumber = $request->input('invoice.number') ?? ('INV-' . date('Ymd') . '-' . str_pad($counter, 5, '0', STR_PAD_LEFT));
-        $issueDate = $request->input('invoice.date') ?? date('Y-m-d');
-        $issueTime = $request->input('invoice.time') ?? date('H:i:s');
-
-        // 3. Format line items
-        $items = $request->input('items', []);
-        $lineItems = array_map(function ($index, $item) {
-            return [
-                'id' => (string) ($index + 1),
-                'name' => $item['name'],
-                'quantity' => (float) $item['quantity'],
-                'tax_exclusive_price' => (float) $item['price'],
-                'VAT_percent' => isset($item['vat_percent']) ? (float) $item['vat_percent'] : 0.15,
-                'other_taxes' => $item['other_taxes'] ?? [],
-                'discounts' => $item['discounts'] ?? [],
-            ];
-        }, array_keys($items), $items);
-
-        $invoice = [
-            'invoice_counter_number' => (string) $counter,
-            'invoice_serial_number' => $invoiceNumber,
-            'issue_date' => $issueDate,
-            'issue_time' => $issueTime,
-            'previous_invoice_hash' => $previousHash,
-            'line_items' => $lineItems,
-        ];
-
-        $egs_unit_data = $unit->toEgsArray();
-
         try {
+            $validator = Validator::make($request->all(), [
+                'unit_id'                => 'required|integer|exists:egs_units,id',
+                'unit_uuid'              => 'nullable|string',
+                'invoice.number'         => 'required|string|unique:invoices,invoice_number',
+                'invoice.date'           => 'required|string',
+                'invoice.time'           => 'required|string',
+                'buyer.name'             => 'required|string',
+                'buyer.vat_number'       => ['required', 'string', 'regex:/^3\d{13}3$/'],
+                'buyer.street'           => 'required|string',
+                'buyer.building'         => 'required|string',
+                'buyer.city'             => 'required|string',
+                'buyer.postal'           => 'required|string',
+                'buyer.city_subdivision' => 'required|string',
+                'buyer.plot'             => 'required|string',
+                'items'                  => 'required|array|min:1',
+                'items.*.name'           => 'required|string',
+                'items.*.quantity'       => 'required|numeric|min:0.01',
+                'items.*.price'          => 'required|numeric|min:0',
+                'items.*.vat_percent'    => 'required|numeric',
+            ], [
+                'unit_id.required'                   => 'The unit_id field is required.',
+                'unit_id.integer'                    => 'The unit_id must be a valid integer.',
+                'unit_id.exists'                     => 'The selected unit_id does not exist in the database.',
+                'unit_uuid.string'                   => 'The unit_uuid must be a valid string.',
+                'invoice.number.required'            => 'The invoice number (invoice.number) is required.',
+                'invoice.number.string'              => 'The invoice number must be a valid string.',
+                'invoice.number.unique'              => 'The invoice number has already been taken.',
+                'invoice.date.required'              => 'The invoice date (invoice.date) is required.',
+                'invoice.date.string'                => 'The invoice date must be a valid string (YYYY-MM-DD).',
+                'invoice.time.required'              => 'The invoice time (invoice.time) is required.',
+                'invoice.time.string'                => 'The invoice time must be a valid string (HH:MM:SS).',
+                'buyer.name.required'                => 'The buyer name (buyer.name) is required.',
+                'buyer.name.string'                  => 'The buyer name must be a string.',
+                'buyer.vat_number.required'          => 'The buyer VAT number (buyer.vat_number) is required.',
+                'buyer.vat_number.regex'             => 'The buyer VAT number must be exactly 15 digits starting and ending with 3 (e.g., 3xxxxxxxxxxxx03).',
+                'buyer.street.required'              => 'The buyer street (buyer.street) is required.',
+                'buyer.street.string'                => 'The buyer street must be a string.',
+                'buyer.building.required'            => 'The buyer building number (buyer.building) is required.',
+                'buyer.building.string'              => 'The buyer building number must be a string.',
+                'buyer.city.required'                => 'The buyer city (buyer.city) is required.',
+                'buyer.city.string'                  => 'The buyer city must be a string.',
+                'buyer.postal.required'              => 'The buyer postal zone (buyer.postal) is required.',
+                'buyer.postal.string'                => 'The buyer postal zone must be a string.',
+                'buyer.city_subdivision.required'    => 'The buyer city subdivision (buyer.city_subdivision) is required.',
+                'buyer.city_subdivision.string'      => 'The buyer city subdivision must be a string.',
+                'buyer.plot.required'                => 'The buyer plot identification (buyer.plot) is required.',
+                'buyer.plot.string'                  => 'The buyer plot identification must be a string.',
+                'items.required'                     => 'The items field is required and must contain at least one line item.',
+                'items.array'                        => 'The items field must be an array of line items.',
+                'items.min'                          => 'At least one line item is required in the items array.',
+                'items.*.name.required'              => 'The name field is required for each line item.',
+                'items.*.name.string'                => 'The name field for each line item must be a string.',
+                'items.*.quantity.required'          => 'The quantity field is required for each line item.',
+                'items.*.quantity.numeric'           => 'The quantity field for each line item must be a numeric value.',
+                'items.*.quantity.min'               => 'The quantity field for each line item must be at least 0.01.',
+                'items.*.price.required'             => 'The price field is required for each line item.',
+                'items.*.price.numeric'              => 'The price field for each line item must be a numeric value.',
+                'items.*.price.min'                  => 'The price field for each line item must be at least 0.',
+                'items.*.vat_percent.required'       => 'The vat_percent field is required for each line item.',
+                'items.*.vat_percent.numeric'        => 'The vat_percent field must be a numeric value (e.g., 0.15 for 15%).',
+            ]);
+
+            if ($validator->fails()) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Validation error: ' . $validator->errors()->first(),
+                    'errors'  => $validator->errors(),
+                ], 422);
+            }
+
+            // 1. Locate EGS unit
+            $unit = EgsUnit::find($request->input('unit_id'));
+            if (!$unit) {
+                return response()->json([
+                    'success' => false,
+                    'message' => "EGS unit with ID {$request->input('unit_id')} not found in database.",
+                ], 404);
+            }
+
+            if ($request->filled('unit_uuid') && $unit->uuid !== $request->input('unit_uuid')) {
+                return response()->json([
+                    'success' => false,
+                    'message' => "Validation error: The provided unit_uuid does not match unit_id {$unit->id}.",
+                    'errors'  => [
+                        'unit_uuid' => ["The provided unit_uuid does not match unit_id {$unit->id}."]
+                    ]
+                ], 422);
+            }
+
+            if (empty($unit->certificate) || empty($unit->private_key)) {
+                return response()->json(['success' => false, 'message' => 'EGS unit has no stored certificate or private key.'], 400);
+            }
+
+            // 2. Sequential chaining (ICV & PIH)
+            $counter      = $unit->current_counter + 1;
+            $previousHash = $unit->last_invoice_hash ?: base64_encode(hash('sha256', '0', true));
+            $invoiceNumber = $request->input('invoice.number') ?? ('SINV-' . date('Ymd') . '-' . str_pad($counter, 5, '0', STR_PAD_LEFT));
+            $issueDate     = $request->input('invoice.date') ?? date('Y-m-d');
+            $issueTime     = $request->input('invoice.time') ?? date('H:i:s');
+
+            // 3. Format line items
+            $items     = $request->input('items', []);
+            $lineItems = array_map(function ($index, $item) {
+                return [
+                    'id'                  => (string) ($index + 1),
+                    'name'                => $item['name'],
+                    'quantity'            => (float) $item['quantity'],
+                    'tax_exclusive_price' => (float) $item['price'],
+                    'VAT_percent'         => isset($item['vat_percent']) ? (float) $item['vat_percent'] : 0.15,
+                    'other_taxes'         => $item['other_taxes'] ?? [],
+                    'discounts'           => $item['discounts'] ?? [],
+                ];
+            }, array_keys($items), $items);
+
+            $invoice = [
+                'invoice_counter_number' => (string) $counter,
+                'invoice_serial_number'  => $invoiceNumber,
+                'issue_date'             => $issueDate,
+                'issue_time'             => $issueTime,
+                'previous_invoice_hash'  => $previousHash,
+                'line_items'             => $lineItems,
+            ];
+
+            $buyer = [
+                'name'             => $request->input('buyer.name'),
+                'vat_number'       => $request->input('buyer.vat_number'),
+                'street'           => $request->input('buyer.street'),
+                'building'         => $request->input('buyer.building'),
+                'city'             => $request->input('buyer.city'),
+                'postal'           => $request->input('buyer.postal'),
+                'city_subdivision' => $request->input('buyer.city_subdivision', ''),
+                'plot'             => $request->input('buyer.plot', '0000'),
+            ];
+
+            $egs_unit_data = $unit->toEgsArray();
+
             $egs = new EGS($egs_unit_data);
             $egs->production = $unit->production;
-            //Log::info($egs->production);
+
+            // 4. Sign using the standard invoice signer
+            list($signed_invoice_string, $invoice_hash, $qr) = $egs->signStandardInvoice(
+                $invoice,
+                $egs_unit_data,
+                $buyer,
+                $unit->certificate,
+                $unit->private_key
+            );
+
+            // 5. Submit to ZATCA
+            $complianceResults = null;
+            try {
+                if ($unit->status === 'onboarded') {
+                    // Standard (B2B) → clearance endpoint
+                    $apiResponse = $egs->clearInvoice(
+                        $signed_invoice_string,
+                        $invoice_hash,
+                        $unit->certificate,
+                        $unit->secret
+                    );
+                    Log::info($apiResponse);
+                } else {
+                    // Compliance phase
+                    $apiResponse = $egs->checkInvoiceCompliance(
+                        $signed_invoice_string,
+                        $invoice_hash,
+                        $unit->certificate,
+                        $unit->secret
+                    );
+                }
+                $complianceResults = json_decode($apiResponse, true);
+            } catch (\Exception $ce) {
+                Log::info($ce->getMessage());
+                $complianceResults = ['warning' => 'ZATCA API note: ' . $ce->getMessage()];
+            }
+
+            // 6. QR Code
+            $qrCode = QrCode::create($qr)
+                ->setEncoding(new Encoding('UTF-8'))
+                ->setErrorCorrectionLevel(ErrorCorrectionLevel::High)
+                ->setSize(300)
+                ->setMargin(10)
+                ->setForegroundColor(new Color(0, 0, 0))
+                ->setBackgroundColor(new Color(255, 255, 255));
+
+            $writer   = new PngWriter();
+            $filename = 'standard-' . time() . '-' . $counter . '.png';
+            $result   = $writer->write($qrCode);
+            $result->saveToFile(public_path('assets/' . $filename));
+
+            // 7. Calculate totals
+            $total_amount = 0;
+            $vat_amount   = 0;
+            foreach ($items as $item) {
+                $vatPercent    = isset($item['vat_percent']) ? (float) $item['vat_percent'] : 0.15;
+                $subtotal      = $item['quantity'] * $item['price'];
+                $total_amount += $subtotal * (1 + $vatPercent);
+                $vat_amount   += $subtotal * $vatPercent;
+            }
+
+            // 8. Save to DB
+            $db_invoice = Invoice::create([
+                'seller_name'        => $unit->vat_name,
+                'vat_number'         => $unit->vat_number,
+                'invoice_number'     => $invoiceNumber,
+                'invoice_type'       => '388',
+                'issue_date'         => $issueDate,
+                'issue_time'         => $issueTime,
+                'total_amount'       => $total_amount,
+                'vat_amount'         => $vat_amount,
+                'invoice_hash'       => $invoice_hash,
+                'qr_code'            => $qr,
+                'qr_url'             => asset('assets/' . $filename),
+                'items_data'         => $items,
+                'compliance_results' => $complianceResults,
+                'signed_xml'         => $signed_invoice_string,
+            ]);
+
+            // 9. Update chain state
+            $unit->current_counter  = $counter;
+            $unit->last_invoice_hash = $invoice_hash;
+            $unit->save();
+
+            return response()->json([
+                'success'               => true,
+                'message'               => 'Standard tax invoice issued, signed, and submitted for clearance successfully!',
+                'invoice_id'            => $db_invoice->id,
+                'invoice_number'        => $invoiceNumber,
+                'invoice_counter'       => $counter,
+                'previous_invoice_hash' => $previousHash,
+                'invoice_hash'          => $invoice_hash,
+                'qr_url'                => asset('assets/' . $filename),
+                'qr_code'               => $qr,
+                'compliance'            => $complianceResults,
+                'unit'                  => [
+                    'id'     => $unit->id,
+                    'uuid'   => $unit->uuid,
+                    'status' => $unit->status,
+                ],
+            ]);
+
+        } catch (\Exception $e) {
+            return response()->json(['success' => false, 'message' => $e->getMessage()], 500);
+        }
+    }
+
+    public function issueInvoice(Request $request)
+    {
+        try {
+            $validator = Validator::make($request->all(), [
+                'unit_id'             => 'required|integer|exists:egs_units,id',
+                'unit_uuid'           => 'nullable|string',
+                'invoice.number'      => 'required|string|unique:invoices,invoice_number',
+                'invoice.date'        => 'required|string',
+                'invoice.time'        => 'required|string',
+                'items'               => 'required|array|min:1',
+                'items.*.name'        => 'required|string',
+                'items.*.quantity'    => 'required|numeric|min:0.01',
+                'items.*.price'       => 'required|numeric|min:0',
+                'items.*.vat_percent' => 'required|numeric',
+            ], [
+                'unit_id.required'            => 'The unit_id field is required.',
+                'unit_id.integer'             => 'The unit_id must be a valid integer.',
+                'unit_id.exists'              => 'The selected unit_id does not exist in the database.',
+                'unit_uuid.string'            => 'The unit_uuid must be a valid string.',
+                'invoice.number.required'     => 'The invoice number (invoice.number) is required.',
+                'invoice.number.string'       => 'The invoice number must be a valid string.',
+                'invoice.number.unique'       => 'The invoice number has already been taken.',
+                'invoice.date.required'       => 'The invoice date (invoice.date) is required.',
+                'invoice.date.string'         => 'The invoice date must be a valid string (YYYY-MM-DD).',
+                'invoice.time.required'       => 'The invoice time (invoice.time) is required.',
+                'invoice.time.string'         => 'The invoice time must be a valid string (HH:MM:SS).',
+                'items.required'              => 'The items field is required and must contain at least one line item.',
+                'items.array'                 => 'The items field must be an array of line items.',
+                'items.min'                   => 'At least one line item is required in the items array.',
+                'items.*.name.required'       => 'The name field is required for each line item.',
+                'items.*.name.string'         => 'The name field for each line item must be a string.',
+                'items.*.quantity.required'   => 'The quantity field is required for each line item.',
+                'items.*.quantity.numeric'    => 'The quantity field for each line item must be a numeric value.',
+                'items.*.quantity.min'        => 'The quantity field for each line item must be at least 0.01.',
+                'items.*.price.required'      => 'The price field is required for each line item.',
+                'items.*.price.numeric'       => 'The price field for each line item must be a numeric value.',
+                'items.*.price.min'           => 'The price field for each line item must be at least 0.',
+                'items.*.vat_percent.required'=> 'The vat_percent field is required for each line item.',
+                'items.*.vat_percent.numeric' => 'The vat_percent field must be a numeric value (e.g., 0.15 for 15%).',
+            ]);
+
+            if ($validator->fails()) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Validation error: ' . $validator->errors()->first(),
+                    'errors'  => $validator->errors(),
+                ], 422);
+            }
+
+            // 1. Locate the onboarded EGS unit
+            $unit = EgsUnit::find($request->input('unit_id'));
+            if (!$unit) {
+                return response()->json([
+                    'success' => false,
+                    'message' => "EGS unit with ID {$request->input('unit_id')} not found in database.",
+                ], 404);
+            }
+
+            if ($request->filled('unit_uuid') && $unit->uuid !== $request->input('unit_uuid')) {
+                return response()->json([
+                    'success' => false,
+                    'message' => "Validation error: The provided unit_uuid does not match unit_id {$unit->id}.",
+                    'errors'  => [
+                        'unit_uuid' => ["The provided unit_uuid does not match unit_id {$unit->id}."]
+                    ]
+                ], 422);
+            }
+
+            if (empty($unit->certificate) || empty($unit->private_key)) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'The selected EGS unit does not have a valid stored certificate or private key.'
+                ], 400);
+            }
+
+            // 2. Automated Sequential Chaining (ICV & PIH)
+            $counter = $unit->current_counter + 1;
+            $previousHash = $unit->last_invoice_hash ?: base64_encode(hash('sha256', '0', true));
+            $invoiceNumber = $request->input('invoice.number') ?? ('INV-' . date('Ymd') . '-' . str_pad($counter, 5, '0', STR_PAD_LEFT));
+            $issueDate = $request->input('invoice.date') ?? date('Y-m-d');
+            $issueTime = $request->input('invoice.time') ?? date('H:i:s');
+
+            // 3. Format line items
+            $items = $request->input('items', []);
+            $lineItems = array_map(function ($index, $item) {
+                return [
+                    'id'                  => (string) ($index + 1),
+                    'name'                => $item['name'],
+                    'quantity'            => (float) $item['quantity'],
+                    'tax_exclusive_price' => (float) $item['price'],
+                    'VAT_percent'         => isset($item['vat_percent']) ? (float) $item['vat_percent'] : 0.15,
+                    'other_taxes'         => $item['other_taxes'] ?? [],
+                    'discounts'           => $item['discounts'] ?? [],
+                ];
+            }, array_keys($items), $items);
+
+            $invoice = [
+                'invoice_counter_number' => (string) $counter,
+                'invoice_serial_number'  => $invoiceNumber,
+                'issue_date'             => $issueDate,
+                'issue_time'             => $issueTime,
+                'previous_invoice_hash'  => $previousHash,
+                'line_items'             => $lineItems,
+            ];
+
+            $egs_unit_data = $unit->toEgsArray();
+
+            $egs = new EGS($egs_unit_data);
+            $egs->production = $unit->production;
+
             // 4. Sign invoice using the STORED certificate and private key
             list($signed_invoice_string, $invoice_hash, $qr) = $egs->signInvoice(
                 $invoice,
@@ -310,7 +595,6 @@ class ZatcaController extends Controller
             try {
                 if ($unit->status === 'onboarded') {
                     // Production: report invoice via /invoices/reporting/single
-
                     $apiResponse = $egs->reportInvoice(
                         $signed_invoice_string,
                         $invoice_hash,
@@ -362,20 +646,20 @@ class ZatcaController extends Controller
 
             // 8. Save invoice to database
             $db_invoice = Invoice::create([
-                'seller_name' => $unit->vat_name,
-                'vat_number' => $unit->vat_number,
-                'invoice_number' => $invoiceNumber,
-                'invoice_type' => '388',
-                'issue_date' => $issueDate,
-                'issue_time' => $issueTime,
-                'total_amount' => $total_amount,
-                'vat_amount' => $vat_amount,
-                'invoice_hash' => $invoice_hash,
-                'qr_code' => $qr,
-                'qr_url' => asset('assets/' . $filename),
-                'items_data' => $items,
+                'seller_name'        => $unit->vat_name,
+                'vat_number'         => $unit->vat_number,
+                'invoice_number'     => $invoiceNumber,
+                'invoice_type'       => '388',
+                'issue_date'         => $issueDate,
+                'issue_time'         => $issueTime,
+                'total_amount'       => $total_amount,
+                'vat_amount'         => $vat_amount,
+                'invoice_hash'       => $invoice_hash,
+                'qr_code'            => $qr,
+                'qr_url'             => asset('assets/' . $filename),
+                'items_data'         => $items,
                 'compliance_results' => $complianceResults,
-                'signed_xml' => $signed_invoice_string,
+                'signed_xml'         => $signed_invoice_string,
             ]);
 
             // 9. Update EGS unit chain state (ICV & PIH)
@@ -384,28 +668,296 @@ class ZatcaController extends Controller
             $unit->save();
 
             return response()->json([
-                'success' => true,
-                'message' => 'Invoice issued, signed with stored certificate, and chained successfully!',
-                'invoice_id' => $db_invoice->id,
-                'invoice_number' => $invoiceNumber,
-                'invoice_counter' => $counter,
+                'success'               => true,
+                'message'               => 'Invoice issued, signed with stored certificate, and chained successfully!',
+                'invoice_id'            => $db_invoice->id,
+                'invoice_number'        => $invoiceNumber,
+                'invoice_counter'       => $counter,
                 'previous_invoice_hash' => $previousHash,
-                'invoice_hash' => $invoice_hash,
-                'qr_url' => asset('assets/' . $filename),
-                'qr_code' => $qr,
-                'compliance' => $complianceResults,
-                'unit' => [
-                    'id' => $unit->id,
-                    'uuid' => $unit->uuid,
+                'invoice_hash'          => $invoice_hash,
+                'qr_url'                => asset('assets/' . $filename),
+                'qr_code'               => $qr,
+                'compliance'            => $complianceResults,
+                'unit'                  => [
+                    'id'     => $unit->id,
+                    'uuid'   => $unit->uuid,
                     'status' => $unit->status,
                 ],
             ]);
 
-        } catch (\Illuminate\Validation\ValidationException $ve) {
+        } catch (\Exception $e) {
             return response()->json([
                 'success' => false,
-                'errors' => $ve->errors(),
-            ], 422);
+                'message' => $e->getMessage(),
+            ], 500);
+        }
+    }
+
+    public function issueStandardCreditNote(Request $request)
+    {
+        try {
+            $validator = Validator::make($request->all(), [
+                'unit_id'                  => 'required|integer|exists:egs_units,id',
+                'unit_uuid'                => 'nullable|string',
+                'reference_invoice_number' => 'required|string',
+                'reason'                   => 'required|string',
+                'payment_method_code'      => 'required|string',
+                'credit_note.number'       => 'required|string|unique:invoices,invoice_number',
+                'credit_note.date'         => 'required|string',
+                'credit_note.time'         => 'required|string',
+                'buyer.name'               => 'required|string',
+                'buyer.vat_number'         => ['required', 'string', 'regex:/^3\d{13}3$/'],
+                'buyer.street'             => 'required|string',
+                'buyer.building'           => 'required|string',
+                'buyer.city'               => 'required|string',
+                'buyer.postal'             => 'required|string',
+                'buyer.city_subdivision'   => 'required|string',
+                'buyer.plot'               => 'required|string',
+                'items'                    => 'required|array|min:1',
+                'items.*.name'             => 'required|string',
+                'items.*.quantity'         => 'required|numeric|min:0.01',
+                'items.*.price'            => 'required|numeric|min:0',
+                'items.*.vat_percent'      => 'required|numeric',
+            ], [
+                'unit_id.required'                  => 'The unit_id field is required.',
+                'unit_id.integer'                   => 'The unit_id must be a valid integer.',
+                'unit_id.exists'                    => 'The selected unit_id does not exist in the database.',
+                'unit_uuid.string'                  => 'The unit_uuid must be a valid string.',
+                'reference_invoice_number.required' => 'The reference invoice number (reference_invoice_number) is required.',
+                'reference_invoice_number.string'   => 'The reference invoice number must be a valid string.',
+                'reason.required'                   => 'The cancellation/amendment reason (reason) is required.',
+                'reason.string'                     => 'The reason must be a valid string.',
+                'payment_method_code.required'      => 'The payment method code (payment_method_code) is required.',
+                'payment_method_code.string'        => 'The payment method code must be a valid string (e.g. "10" for cash, "42" for bank account).',
+                'credit_note.number.required'       => 'The credit note number (credit_note.number) is required.',
+                'credit_note.number.string'         => 'The credit note number must be a valid string.',
+                'credit_note.number.unique'         => 'The credit note number has already been taken.',
+                'credit_note.date.required'         => 'The credit note date (credit_note.date) is required.',
+                'credit_note.date.string'           => 'The credit note date must be a valid string (YYYY-MM-DD).',
+                'credit_note.time.required'         => 'The credit note time (credit_note.time) is required.',
+                'credit_note.time.string'           => 'The credit note time must be a valid string (HH:MM:SS).',
+                'buyer.name.required'               => 'The buyer name (buyer.name) is required.',
+                'buyer.name.string'                 => 'The buyer name must be a string.',
+                'buyer.vat_number.required'         => 'The buyer VAT number (buyer.vat_number) is required.',
+                'buyer.vat_number.regex'            => 'The buyer VAT number must be exactly 15 digits starting and ending with 3 (e.g., 3xxxxxxxxxxxx03).',
+                'buyer.street.required'             => 'The buyer street (buyer.street) is required.',
+                'buyer.street.string'               => 'The buyer street must be a string.',
+                'buyer.building.required'           => 'The buyer building number (buyer.building) is required.',
+                'buyer.building.string'             => 'The buyer building number must be a string.',
+                'buyer.city.required'               => 'The buyer city (buyer.city) is required.',
+                'buyer.city.string'                 => 'The buyer city must be a string.',
+                'buyer.postal.required'             => 'The buyer postal zone (buyer.postal) is required.',
+                'buyer.postal.string'               => 'The buyer postal zone must be a string.',
+                'buyer.city_subdivision.required'   => 'The buyer city subdivision (buyer.city_subdivision) is required.',
+                'buyer.city_subdivision.string'     => 'The buyer city subdivision must be a string.',
+                'buyer.plot.required'               => 'The buyer plot identification (buyer.plot) is required.',
+                'buyer.plot.string'                 => 'The buyer plot identification must be a string.',
+                'items.required'                    => 'The items field is required and must contain at least one line item.',
+                'items.array'                       => 'The items field must be an array of line items.',
+                'items.min'                         => 'At least one line item is required in the items array.',
+                'items.*.name.required'             => 'The name field is required for each line item.',
+                'items.*.name.string'               => 'The name field for each line item must be a string.',
+                'items.*.quantity.required'         => 'The quantity field is required for each line item.',
+                'items.*.quantity.numeric'          => 'The quantity field for each line item must be a numeric value.',
+                'items.*.quantity.min'              => 'The quantity field for each line item must be at least 0.01.',
+                'items.*.price.required'            => 'The price field is required for each line item.',
+                'items.*.price.numeric'             => 'The price field for each line item must be a numeric value.',
+                'items.*.price.min'                 => 'The price field for each line item must be at least 0.',
+                'items.*.vat_percent.required'      => 'The vat_percent field is required for each line item.',
+                'items.*.vat_percent.numeric'       => 'The vat_percent field must be a numeric value (e.g., 0.15 for 15%).',
+            ]);
+
+            if ($validator->fails()) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Validation error: ' . $validator->errors()->first(),
+                    'errors'  => $validator->errors(),
+                ], 422);
+            }
+
+            // 1. Locate the onboarded EGS unit
+            $unit = EgsUnit::find($request->input('unit_id'));
+            if (!$unit) {
+                return response()->json([
+                    'success' => false,
+                    'message' => "EGS unit with ID {$request->input('unit_id')} not found in database.",
+                ], 404);
+            }
+
+            if ($request->filled('unit_uuid') && $unit->uuid !== $request->input('unit_uuid')) {
+                return response()->json([
+                    'success' => false,
+                    'message' => "Validation error: The provided unit_uuid does not match unit_id {$unit->id}.",
+                    'errors'  => [
+                        'unit_uuid' => ["The provided unit_uuid does not match unit_id {$unit->id}."]
+                    ]
+                ], 422);
+            }
+
+            if (empty($unit->certificate) || empty($unit->private_key)) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'The selected EGS unit does not have a valid stored certificate or private key.'
+                ], 400);
+            }
+
+            // 2. Automated Sequential Chaining (ICV & PIH)
+            $counter = $unit->current_counter + 1;
+            $previousHash = $unit->last_invoice_hash ?: base64_encode(hash('sha256', '0', true));
+            $creditNoteNumber = $request->input('credit_note.number') ?? ('SCN-' . date('Ymd') . '-' . str_pad($counter, 5, '0', STR_PAD_LEFT));
+            $issueDate = $request->input('credit_note.date') ?? date('Y-m-d');
+            $issueTime = $request->input('credit_note.time') ?? date('H:i:s');
+            $referenceInvoiceNumber = $request->input('reference_invoice_number');
+            $reason = $request->input('reason');
+            $paymentMethodCode = $request->input('payment_method_code', '10');
+
+            // 3. Format line items (must be positive amounts representing credited values)
+            $items = $request->input('items', []);
+            $lineItems = array_map(function ($index, $item) {
+                return [
+                    'id'                  => (string) ($index + 1),
+                    'name'                => $item['name'],
+                    'quantity'            => (float) $item['quantity'],
+                    'tax_exclusive_price' => (float) $item['price'],
+                    'VAT_percent'         => isset($item['vat_percent']) ? (float) $item['vat_percent'] : 0.15,
+                    'other_taxes'         => $item['other_taxes'] ?? [],
+                    'discounts'           => $item['discounts'] ?? [],
+                ];
+            }, array_keys($items), $items);
+
+            $creditNoteData = [
+                'invoice_counter_number' => (string) $counter,
+                'invoice_serial_number'  => $creditNoteNumber,
+                'issue_date'             => $issueDate,
+                'issue_time'             => $issueTime,
+                'previous_invoice_hash'  => $previousHash,
+                'line_items'             => $lineItems,
+            ];
+
+            $buyer = [
+                'name'             => $request->input('buyer.name'),
+                'vat_number'       => $request->input('buyer.vat_number'),
+                'street'           => $request->input('buyer.street'),
+                'building'         => $request->input('buyer.building'),
+                'city'             => $request->input('buyer.city'),
+                'postal'           => $request->input('buyer.postal'),
+                'city_subdivision' => $request->input('buyer.city_subdivision', ''),
+                'plot'             => $request->input('buyer.plot', '0000'),
+            ];
+
+            $egs_unit_data = $unit->toEgsArray('CREDIT_NOTE', $referenceInvoiceNumber);
+
+            $egs = new EGS($egs_unit_data);
+            $egs->production = $unit->production;
+
+            // 4. Sign standard credit note using the STORED certificate and private key
+            list($signed_credit_note_string, $credit_note_hash, $qr) = $egs->signStandardCreditNote(
+                $creditNoteData,
+                $egs_unit_data,
+                $buyer,
+                $unit->certificate,
+                $unit->private_key,
+                $referenceInvoiceNumber,
+                $reason,
+                $paymentMethodCode
+            );
+
+            // 5. Submit to ZATCA: clearance endpoint for standard B2B
+            $complianceResults = null;
+            try {
+                if ($unit->status === 'onboarded') {
+                    $apiResponse = $egs->clearInvoice(
+                        $signed_credit_note_string,
+                        $credit_note_hash,
+                        $unit->certificate,
+                        $unit->secret
+                    );
+                    Log::info($apiResponse);
+                } else {
+                    $apiResponse = $egs->checkInvoiceCompliance(
+                        $signed_credit_note_string,
+                        $credit_note_hash,
+                        $unit->certificate,
+                        $unit->secret
+                    );
+                }
+                $complianceResults = json_decode($apiResponse, true);
+            } catch (\Exception $ce) {
+                Log::info($ce->getMessage());
+                $complianceResults = [
+                    'warning' => 'ZATCA API note: ' . $ce->getMessage()
+                ];
+            }
+
+            // 6. Generate and save QR Code
+            $qrCode = QrCode::create($qr)
+                ->setEncoding(new Encoding('UTF-8'))
+                ->setErrorCorrectionLevel(ErrorCorrectionLevel::High)
+                ->setSize(300)
+                ->setMargin(10)
+                ->setForegroundColor(new Color(0, 0, 0))
+                ->setBackgroundColor(new Color(255, 255, 255));
+
+            $writer = new PngWriter();
+            $filename = 'standard-credit-note-' . time() . '-' . $counter . '.png';
+            $result = $writer->write($qrCode);
+            $result->saveToFile(public_path('assets/' . $filename));
+
+            // 7. Calculate totals
+            $total_amount = 0;
+            $vat_amount = 0;
+            foreach ($items as $item) {
+                $vatPercent = isset($item['vat_percent']) ? (float) $item['vat_percent'] : 0.15;
+                $subtotal = $item['quantity'] * $item['price'];
+                $total_amount += $subtotal * (1 + $vatPercent);
+                $vat_amount += $subtotal * $vatPercent;
+            }
+
+            // 8. Save credit note to database
+            $db_invoice = Invoice::create([
+                'seller_name'              => $unit->vat_name,
+                'vat_number'               => $unit->vat_number,
+                'invoice_number'           => $creditNoteNumber,
+                'invoice_type'             => '381',
+                'reference_invoice_number' => $referenceInvoiceNumber,
+                'reason'                   => $reason,
+                'issue_date'               => $issueDate,
+                'issue_time'               => $issueTime,
+                'total_amount'             => $total_amount,
+                'vat_amount'               => $vat_amount,
+                'invoice_hash'             => $credit_note_hash,
+                'qr_code'                  => $qr,
+                'qr_url'                   => asset('assets/' . $filename),
+                'items_data'               => $items,
+                'compliance_results'       => $complianceResults,
+                'signed_xml'               => $signed_credit_note_string,
+            ]);
+
+            // 9. Update EGS unit chain state (ICV & PIH)
+            $unit->current_counter = $counter;
+            $unit->last_invoice_hash = $credit_note_hash;
+            $unit->save();
+
+            return response()->json([
+                'success'                  => true,
+                'message'                  => 'Standard credit note issued, signed, and submitted for clearance successfully!',
+                'credit_note_id'           => $db_invoice->id,
+                'credit_note_number'       => $creditNoteNumber,
+                'credit_note_counter'      => $counter,
+                'reference_invoice_number' => $referenceInvoiceNumber,
+                'reason'                   => $reason,
+                'previous_invoice_hash'    => $previousHash,
+                'credit_note_hash'         => $credit_note_hash,
+                'qr_url'                   => asset('assets/' . $filename),
+                'qr_code'                  => $qr,
+                'compliance'               => $complianceResults,
+                'unit'                     => [
+                    'id'     => $unit->id,
+                    'uuid'   => $unit->uuid,
+                    'status' => $unit->status,
+                ],
+            ]);
+
         } catch (\Exception $e) {
             return response()->json([
                 'success' => false,
@@ -417,45 +969,86 @@ class ZatcaController extends Controller
     public function issueCreditNote(Request $request)
     {
         try {
-            $validated = $request->validate([
-            'reference_invoice_number' => 'required|string',
-            'reason' => 'required|string',
-            'payment_method_code' => 'nullable|string',
-            'unit_id' => 'nullable|integer',
-            'unit_uuid' => 'nullable|string',
-            'credit_note.number' => 'nullable|string|unique:invoices,invoice_number',
-            'credit_note.date' => 'nullable|string',
-            'credit_note.time' => 'nullable|string',
-            'items' => 'required|array|min:1',
-            'items.*.name' => 'required|string',
-            'items.*.quantity' => 'required|numeric|min:0.01',
-            'items.*.price' => 'required|numeric|min:0',
-            'items.*.vat_percent' => 'nullable|numeric',
-        ]);
+            $validator = Validator::make($request->all(), [
+                'unit_id'                  => 'required|integer|exists:egs_units,id',
+                'unit_uuid'                => 'nullable|string',
+                'reference_invoice_number' => 'required|string',
+                'reason'                   => 'required|string',
+                'payment_method_code'      => 'required|string',
+                'credit_note.number'       => 'required|string|unique:invoices,invoice_number',
+                'credit_note.date'         => 'required|string',
+                'credit_note.time'         => 'required|string',
+                'items'                    => 'required|array|min:1',
+                'items.*.name'             => 'required|string',
+                'items.*.quantity'         => 'required|numeric|min:0.01',
+                'items.*.price'            => 'required|numeric|min:0',
+                'items.*.vat_percent'      => 'required|numeric',
+            ], [
+                'unit_id.required'                  => 'The unit_id field is required.',
+                'unit_id.integer'                   => 'The unit_id must be a valid integer.',
+                'unit_id.exists'                    => 'The selected unit_id does not exist in the database.',
+                'unit_uuid.string'                  => 'The unit_uuid must be a valid string.',
+                'reference_invoice_number.required' => 'The reference invoice number (reference_invoice_number) is required.',
+                'reference_invoice_number.string'   => 'The reference invoice number must be a valid string.',
+                'reason.required'                   => 'The cancellation/amendment reason (reason) is required.',
+                'reason.string'                     => 'The reason must be a valid string.',
+                'payment_method_code.required'      => 'The payment method code (payment_method_code) is required.',
+                'payment_method_code.string'        => 'The payment method code must be a valid string (e.g. "10" for cash, "42" for bank account).',
+                'credit_note.number.required'       => 'The credit note number (credit_note.number) is required.',
+                'credit_note.number.string'         => 'The credit note number must be a valid string.',
+                'credit_note.number.unique'         => 'The credit note number has already been taken.',
+                'credit_note.date.required'         => 'The credit note date (credit_note.date) is required.',
+                'credit_note.date.string'           => 'The credit note date must be a valid string (YYYY-MM-DD).',
+                'credit_note.time.required'         => 'The credit note time (credit_note.time) is required.',
+                'credit_note.time.string'           => 'The credit note time must be a valid string (HH:MM:SS).',
+                'items.required'                    => 'The items field is required and must contain at least one line item.',
+                'items.array'                       => 'The items field must be an array of line items.',
+                'items.min'                         => 'At least one line item is required in the items array.',
+                'items.*.name.required'             => 'The name field is required for each line item.',
+                'items.*.name.string'               => 'The name field for each line item must be a string.',
+                'items.*.quantity.required'         => 'The quantity field is required for each line item.',
+                'items.*.quantity.numeric'          => 'The quantity field for each line item must be a numeric value.',
+                'items.*.quantity.min'              => 'The quantity field for each line item must be at least 0.01.',
+                'items.*.price.required'            => 'The price field is required for each line item.',
+                'items.*.price.numeric'             => 'The price field for each line item must be a numeric value.',
+                'items.*.price.min'                 => 'The price field for each line item must be at least 0.',
+                'items.*.vat_percent.required'      => 'The vat_percent field is required for each line item.',
+                'items.*.vat_percent.numeric'       => 'The vat_percent field must be a numeric value (e.g., 0.15 for 15%).',
+            ]);
 
-        // 1. Locate the onboarded EGS unit
-        $unit = null;
-        if ($request->filled('unit_id')) {
+            if ($validator->fails()) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Validation error: ' . $validator->errors()->first(),
+                    'errors'  => $validator->errors(),
+                ], 422);
+            }
+
+            // 1. Locate the onboarded EGS unit
             $unit = EgsUnit::find($request->input('unit_id'));
-        } elseif ($request->filled('unit_uuid')) {
-            $unit = EgsUnit::where('uuid', $request->input('unit_uuid'))->first();
-        } else {
-            $unit = EgsUnit::latest()->first();
-        }
+            if (!$unit) {
+                return response()->json([
+                    'success' => false,
+                    'message' => "EGS unit with ID {$request->input('unit_id')} not found in database.",
+                ], 404);
+            }
 
-        if (!$unit) {
-            return response()->json([
-                'success' => false,
-                'message' => 'No onboarded EGS unit found in the database. Please onboard a unit first via POST /api/zatca/onboard.'
-            ], 404);
-        }
+            if ($request->filled('unit_uuid') && $unit->uuid !== $request->input('unit_uuid')) {
+                return response()->json([
+                    'success' => false,
+                    'message' => "Validation error: The provided unit_uuid does not match unit_id {$unit->id}.",
+                    'errors'  => [
+                        'unit_uuid' => ["The provided unit_uuid does not match unit_id {$unit->id}."]
+                    ]
+                ], 422);
+            }
 
-        if (empty($unit->certificate) || empty($unit->private_key)) {
-            return response()->json([
-                'success' => false,
-                'message' => 'The selected EGS unit does not have a valid stored certificate or private key.'
-            ], 400);
-        }
+            if (empty($unit->certificate) || empty($unit->private_key)) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'The selected EGS unit does not have a valid stored certificate or private key.'
+                ], 400);
+            }
 
         // 2. Automated Sequential Chaining (ICV & PIH)
         $counter = $unit->current_counter + 1;
@@ -599,11 +1192,279 @@ class ZatcaController extends Controller
                 ],
             ]);
 
-        } catch (\Illuminate\Validation\ValidationException $ve) {
+        } catch (\Exception $e) {
             return response()->json([
                 'success' => false,
-                'errors' => $ve->errors(),
-            ], 422);
+                'message' => $e->getMessage(),
+            ], 500);
+        }
+    }
+
+    public function issueStandardDebitNote(Request $request)
+    {
+        try {
+            $validator = Validator::make($request->all(), [
+                'unit_id'                  => 'required|integer|exists:egs_units,id',
+                'unit_uuid'                => 'nullable|string',
+                'reference_invoice_number' => 'required|string',
+                'reason'                   => 'required|string',
+                'payment_method_code'      => 'required|string',
+                'debit_note.number'        => 'required|string|unique:invoices,invoice_number',
+                'debit_note.date'          => 'required|string',
+                'debit_note.time'          => 'required|string',
+                'buyer.name'               => 'required|string',
+                'buyer.vat_number'         => ['required', 'string', 'regex:/^3\d{13}3$/'],
+                'buyer.street'             => 'required|string',
+                'buyer.building'           => 'required|string',
+                'buyer.city'               => 'required|string',
+                'buyer.postal'             => 'required|string',
+                'buyer.city_subdivision'   => 'required|string',
+                'buyer.plot'               => 'required|string',
+                'items'                    => 'required|array|min:1',
+                'items.*.name'             => 'required|string',
+                'items.*.quantity'         => 'required|numeric|min:0.01',
+                'items.*.price'            => 'required|numeric|min:0',
+                'items.*.vat_percent'      => 'required|numeric',
+            ], [
+                'unit_id.required'                  => 'The unit_id field is required.',
+                'unit_id.integer'                   => 'The unit_id must be a valid integer.',
+                'unit_id.exists'                    => 'The selected unit_id does not exist in the database.',
+                'unit_uuid.string'                  => 'The unit_uuid must be a valid string.',
+                'reference_invoice_number.required' => 'The reference invoice number (reference_invoice_number) is required.',
+                'reference_invoice_number.string'   => 'The reference invoice number must be a valid string.',
+                'reason.required'                   => 'The cancellation/amendment reason (reason) is required.',
+                'reason.string'                     => 'The reason must be a valid string.',
+                'payment_method_code.required'      => 'The payment method code (payment_method_code) is required.',
+                'payment_method_code.string'        => 'The payment method code must be a valid string (e.g. "10" for cash, "42" for bank account).',
+                'debit_note.number.required'        => 'The debit note number (debit_note.number) is required.',
+                'debit_note.number.string'          => 'The debit note number must be a valid string.',
+                'debit_note.number.unique'          => 'The debit note number has already been taken.',
+                'debit_note.date.required'          => 'The debit note date (debit_note.date) is required.',
+                'debit_note.date.string'            => 'The debit note date must be a valid string (YYYY-MM-DD).',
+                'debit_note.time.required'          => 'The debit note time (debit_note.time) is required.',
+                'debit_note.time.string'            => 'The debit note time must be a valid string (HH:MM:SS).',
+                'buyer.name.required'               => 'The buyer name (buyer.name) is required.',
+                'buyer.name.string'                 => 'The buyer name must be a string.',
+                'buyer.vat_number.required'         => 'The buyer VAT number (buyer.vat_number) is required.',
+                'buyer.vat_number.regex'            => 'The buyer VAT number must be exactly 15 digits starting and ending with 3 (e.g., 3xxxxxxxxxxxx03).',
+                'buyer.street.required'             => 'The buyer street (buyer.street) is required.',
+                'buyer.street.string'               => 'The buyer street must be a string.',
+                'buyer.building.required'           => 'The buyer building number (buyer.building) is required.',
+                'buyer.building.string'             => 'The buyer building number must be a string.',
+                'buyer.city.required'               => 'The buyer city (buyer.city) is required.',
+                'buyer.city.string'                 => 'The buyer city must be a string.',
+                'buyer.postal.required'             => 'The buyer postal zone (buyer.postal) is required.',
+                'buyer.postal.string'               => 'The buyer postal zone must be a string.',
+                'buyer.city_subdivision.required'   => 'The buyer city subdivision (buyer.city_subdivision) is required.',
+                'buyer.city_subdivision.string'     => 'The buyer city subdivision must be a string.',
+                'buyer.plot.required'               => 'The buyer plot identification (buyer.plot) is required.',
+                'buyer.plot.string'                 => 'The buyer plot identification must be a string.',
+                'items.required'                    => 'The items field is required and must contain at least one line item.',
+                'items.array'                       => 'The items field must be an array of line items.',
+                'items.min'                         => 'At least one line item is required in the items array.',
+                'items.*.name.required'             => 'The name field is required for each line item.',
+                'items.*.name.string'               => 'The name field for each line item must be a string.',
+                'items.*.quantity.required'         => 'The quantity field is required for each line item.',
+                'items.*.quantity.numeric'          => 'The quantity field for each line item must be a numeric value.',
+                'items.*.quantity.min'              => 'The quantity field for each line item must be at least 0.01.',
+                'items.*.price.required'            => 'The price field is required for each line item.',
+                'items.*.price.numeric'             => 'The price field for each line item must be a numeric value.',
+                'items.*.price.min'                 => 'The price field for each line item must be at least 0.',
+                'items.*.vat_percent.required'      => 'The vat_percent field is required for each line item.',
+                'items.*.vat_percent.numeric'       => 'The vat_percent field must be a numeric value (e.g., 0.15 for 15%).',
+            ]);
+
+            if ($validator->fails()) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Validation error: ' . $validator->errors()->first(),
+                    'errors'  => $validator->errors(),
+                ], 422);
+            }
+
+            // 1. Locate the onboarded EGS unit
+            $unit = EgsUnit::find($request->input('unit_id'));
+            if (!$unit) {
+                return response()->json([
+                    'success' => false,
+                    'message' => "EGS unit with ID {$request->input('unit_id')} not found in database.",
+                ], 404);
+            }
+
+            if ($request->filled('unit_uuid') && $unit->uuid !== $request->input('unit_uuid')) {
+                return response()->json([
+                    'success' => false,
+                    'message' => "Validation error: The provided unit_uuid does not match unit_id {$unit->id}.",
+                    'errors'  => [
+                        'unit_uuid' => ["The provided unit_uuid does not match unit_id {$unit->id}."]
+                    ]
+                ], 422);
+            }
+
+            if (empty($unit->certificate) || empty($unit->private_key)) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'The selected EGS unit does not have a valid stored certificate or private key.'
+                ], 400);
+            }
+
+            // 2. Automated Sequential Chaining (ICV & PIH)
+            $counter = $unit->current_counter + 1;
+            $previousHash = $unit->last_invoice_hash ?: base64_encode(hash('sha256', '0', true));
+            $debitNoteNumber = $request->input('debit_note.number') ?? ('SDN-' . date('Ymd') . '-' . str_pad($counter, 5, '0', STR_PAD_LEFT));
+            $issueDate = $request->input('debit_note.date') ?? date('Y-m-d');
+            $issueTime = $request->input('debit_note.time') ?? date('H:i:s');
+            $referenceInvoiceNumber = $request->input('reference_invoice_number');
+            $reason = $request->input('reason');
+            $paymentMethodCode = $request->input('payment_method_code', '10');
+
+            // 3. Format line items (must be positive amounts representing debited/additional charges)
+            $items = $request->input('items', []);
+            $lineItems = array_map(function ($index, $item) {
+                return [
+                    'id'                  => (string) ($index + 1),
+                    'name'                => $item['name'],
+                    'quantity'            => (float) $item['quantity'],
+                    'tax_exclusive_price' => (float) $item['price'],
+                    'VAT_percent'         => isset($item['vat_percent']) ? (float) $item['vat_percent'] : 0.15,
+                    'other_taxes'         => $item['other_taxes'] ?? [],
+                    'discounts'           => $item['discounts'] ?? [],
+                ];
+            }, array_keys($items), $items);
+
+            $debitNoteData = [
+                'invoice_counter_number' => (string) $counter,
+                'invoice_serial_number'  => $debitNoteNumber,
+                'issue_date'             => $issueDate,
+                'issue_time'             => $issueTime,
+                'previous_invoice_hash'  => $previousHash,
+                'line_items'             => $lineItems,
+            ];
+
+            $buyer = [
+                'name'             => $request->input('buyer.name'),
+                'vat_number'       => $request->input('buyer.vat_number'),
+                'street'           => $request->input('buyer.street'),
+                'building'         => $request->input('buyer.building'),
+                'city'             => $request->input('buyer.city'),
+                'postal'           => $request->input('buyer.postal'),
+                'city_subdivision' => $request->input('buyer.city_subdivision', ''),
+                'plot'             => $request->input('buyer.plot', '0000'),
+            ];
+
+            $egs_unit_data = $unit->toEgsArray('DEBIT_NOTE', $referenceInvoiceNumber);
+
+            $egs = new EGS($egs_unit_data);
+            $egs->production = $unit->production;
+
+            // 4. Sign standard debit note using the STORED certificate and private key
+            list($signed_debit_note_string, $debit_note_hash, $qr) = $egs->signStandardDebitNote(
+                $debitNoteData,
+                $egs_unit_data,
+                $buyer,
+                $unit->certificate,
+                $unit->private_key,
+                $referenceInvoiceNumber,
+                $reason,
+                $paymentMethodCode
+            );
+
+            // 5. Submit to ZATCA: clearance endpoint for standard B2B
+            $complianceResults = null;
+            try {
+                if ($unit->status === 'onboarded') {
+                    $apiResponse = $egs->clearInvoice(
+                        $signed_debit_note_string,
+                        $debit_note_hash,
+                        $unit->certificate,
+                        $unit->secret
+                    );
+                    Log::info($apiResponse);
+                } else {
+                    $apiResponse = $egs->checkInvoiceCompliance(
+                        $signed_debit_note_string,
+                        $debit_note_hash,
+                        $unit->certificate,
+                        $unit->secret
+                    );
+                }
+                $complianceResults = json_decode($apiResponse, true);
+            } catch (\Exception $ce) {
+                Log::info($ce->getMessage());
+                $complianceResults = [
+                    'warning' => 'ZATCA API note: ' . $ce->getMessage()
+                ];
+            }
+
+            // 6. Generate and save QR Code
+            $qrCode = QrCode::create($qr)
+                ->setEncoding(new Encoding('UTF-8'))
+                ->setErrorCorrectionLevel(ErrorCorrectionLevel::High)
+                ->setSize(300)
+                ->setMargin(10)
+                ->setForegroundColor(new Color(0, 0, 0))
+                ->setBackgroundColor(new Color(255, 255, 255));
+
+            $writer = new PngWriter();
+            $filename = 'standard-debit-note-' . time() . '-' . $counter . '.png';
+            $result = $writer->write($qrCode);
+            $result->saveToFile(public_path('assets/' . $filename));
+
+            // 7. Calculate totals
+            $total_amount = 0;
+            $vat_amount = 0;
+            foreach ($items as $item) {
+                $vatPercent = isset($item['vat_percent']) ? (float) $item['vat_percent'] : 0.15;
+                $subtotal = $item['quantity'] * $item['price'];
+                $total_amount += $subtotal * (1 + $vatPercent);
+                $vat_amount += $subtotal * $vatPercent;
+            }
+
+            // 8. Save debit note to database
+            $db_invoice = Invoice::create([
+                'seller_name'              => $unit->vat_name,
+                'vat_number'               => $unit->vat_number,
+                'invoice_number'           => $debitNoteNumber,
+                'invoice_type'             => '383',
+                'reference_invoice_number' => $referenceInvoiceNumber,
+                'reason'                   => $reason,
+                'issue_date'               => $issueDate,
+                'issue_time'               => $issueTime,
+                'total_amount'             => $total_amount,
+                'vat_amount'               => $vat_amount,
+                'invoice_hash'             => $debit_note_hash,
+                'qr_code'                  => $qr,
+                'qr_url'                   => asset('assets/' . $filename),
+                'items_data'               => $items,
+                'compliance_results'       => $complianceResults,
+                'signed_xml'               => $signed_debit_note_string,
+            ]);
+
+            // 9. Update EGS unit chain state (ICV & PIH)
+            $unit->current_counter = $counter;
+            $unit->last_invoice_hash = $debit_note_hash;
+            $unit->save();
+
+            return response()->json([
+                'success'                  => true,
+                'message'                  => 'Standard debit note issued, signed, and submitted for clearance successfully!',
+                'debit_note_id'            => $db_invoice->id,
+                'debit_note_number'        => $debitNoteNumber,
+                'debit_note_counter'       => $counter,
+                'reference_invoice_number' => $referenceInvoiceNumber,
+                'reason'                   => $reason,
+                'previous_invoice_hash'    => $previousHash,
+                'debit_note_hash'          => $debit_note_hash,
+                'qr_url'                   => asset('assets/' . $filename),
+                'qr_code'                  => $qr,
+                'compliance'               => $complianceResults,
+                'unit'                     => [
+                    'id'     => $unit->id,
+                    'uuid'   => $unit->uuid,
+                    'status' => $unit->status,
+                ],
+            ]);
+
         } catch (\Exception $e) {
             return response()->json([
                 'success' => false,
@@ -615,37 +1476,78 @@ class ZatcaController extends Controller
     public function issueDebitNote(Request $request)
     {
         try {
-            $validated = $request->validate([
+            $validator = Validator::make($request->all(), [
+                'unit_id'                  => 'required|integer|exists:egs_units,id',
+                'unit_uuid'                => 'nullable|string',
                 'reference_invoice_number' => 'required|string',
-                'reason' => 'required|string',
-                'payment_method_code' => 'nullable|string',
-                'unit_id' => 'nullable|integer',
-                'unit_uuid' => 'nullable|string',
-                'debit_note.number' => 'nullable|string|unique:invoices,invoice_number',
-                'debit_note.date' => 'nullable|string',
-                'debit_note.time' => 'nullable|string',
-                'items' => 'required|array|min:1',
-                'items.*.name' => 'required|string',
-                'items.*.quantity' => 'required|numeric|min:0.01',
-                'items.*.price' => 'required|numeric|min:0',
-                'items.*.vat_percent' => 'nullable|numeric',
+                'reason'                   => 'required|string',
+                'payment_method_code'      => 'required|string',
+                'debit_note.number'        => 'required|string|unique:invoices,invoice_number',
+                'debit_note.date'          => 'required|string',
+                'debit_note.time'          => 'required|string',
+                'items'                    => 'required|array|min:1',
+                'items.*.name'             => 'required|string',
+                'items.*.quantity'         => 'required|numeric|min:0.01',
+                'items.*.price'            => 'required|numeric|min:0',
+                'items.*.vat_percent'      => 'required|numeric',
+            ], [
+                'unit_id.required'                  => 'The unit_id field is required.',
+                'unit_id.integer'                   => 'The unit_id must be a valid integer.',
+                'unit_id.exists'                    => 'The selected unit_id does not exist in the database.',
+                'unit_uuid.string'                  => 'The unit_uuid must be a valid string.',
+                'reference_invoice_number.required' => 'The reference invoice number (reference_invoice_number) is required.',
+                'reference_invoice_number.string'   => 'The reference invoice number must be a valid string.',
+                'reason.required'                   => 'The cancellation/amendment reason (reason) is required.',
+                'reason.string'                     => 'The reason must be a valid string.',
+                'payment_method_code.required'      => 'The payment method code (payment_method_code) is required.',
+                'payment_method_code.string'        => 'The payment method code must be a valid string (e.g. "10" for cash, "42" for bank account).',
+                'debit_note.number.required'        => 'The debit note number (debit_note.number) is required.',
+                'debit_note.number.string'          => 'The debit note number must be a valid string.',
+                'debit_note.number.unique'          => 'The debit note number has already been taken.',
+                'debit_note.date.required'          => 'The debit note date (debit_note.date) is required.',
+                'debit_note.date.string'            => 'The debit note date must be a valid string (YYYY-MM-DD).',
+                'debit_note.time.required'          => 'The debit note time (debit_note.time) is required.',
+                'debit_note.time.string'            => 'The debit note time must be a valid string (HH:MM:SS).',
+                'items.required'                    => 'The items field is required and must contain at least one line item.',
+                'items.array'                       => 'The items field must be an array of line items.',
+                'items.min'                         => 'At least one line item is required in the items array.',
+                'items.*.name.required'             => 'The name field is required for each line item.',
+                'items.*.name.string'               => 'The name field for each line item must be a string.',
+                'items.*.quantity.required'         => 'The quantity field is required for each line item.',
+                'items.*.quantity.numeric'          => 'The quantity field for each line item must be a numeric value.',
+                'items.*.quantity.min'              => 'The quantity field for each line item must be at least 0.01.',
+                'items.*.price.required'            => 'The price field is required for each line item.',
+                'items.*.price.numeric'             => 'The price field for each line item must be a numeric value.',
+                'items.*.price.min'                 => 'The price field for each line item must be at least 0.',
+                'items.*.vat_percent.required'      => 'The vat_percent field is required for each line item.',
+                'items.*.vat_percent.numeric'       => 'The vat_percent field must be a numeric value (e.g., 0.15 for 15%).',
             ]);
 
-            // 1. Locate the onboarded EGS unit
-            $unit = null;
-            if ($request->filled('unit_id')) {
-                $unit = EgsUnit::find($request->input('unit_id'));
-            } elseif ($request->filled('unit_uuid')) {
-                $unit = EgsUnit::where('uuid', $request->input('unit_uuid'))->first();
-            } else {
-                $unit = EgsUnit::latest()->first();
+            if ($validator->fails()) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Validation error: ' . $validator->errors()->first(),
+                    'errors'  => $validator->errors(),
+                ], 422);
             }
 
+            // 1. Locate the onboarded EGS unit
+            $unit = EgsUnit::find($request->input('unit_id'));
             if (!$unit) {
                 return response()->json([
                     'success' => false,
-                    'message' => 'No onboarded EGS unit found in the database. Please onboard a unit first via POST /api/zatca/onboard.'
+                    'message' => "EGS unit with ID {$request->input('unit_id')} not found in database.",
                 ], 404);
+            }
+
+            if ($request->filled('unit_uuid') && $unit->uuid !== $request->input('unit_uuid')) {
+                return response()->json([
+                    'success' => false,
+                    'message' => "Validation error: The provided unit_uuid does not match unit_id {$unit->id}.",
+                    'errors'  => [
+                        'unit_uuid' => ["The provided unit_uuid does not match unit_id {$unit->id}."]
+                    ]
+                ], 422);
             }
 
             if (empty($unit->certificate) || empty($unit->private_key)) {
@@ -798,11 +1700,6 @@ class ZatcaController extends Controller
                 ],
             ]);
 
-        } catch (\Illuminate\Validation\ValidationException $ve) {
-            return response()->json([
-                'success' => false,
-                'errors' => $ve->errors(),
-            ], 422);
         } catch (\Exception $e) {
             return response()->json([
                 'success' => false,
@@ -1008,11 +1905,53 @@ class ZatcaController extends Controller
                 ],
             ]);
 
-        } catch (\Illuminate\Validation\ValidationException $ve) {
+        } catch (\Exception $e) {
             return response()->json([
                 'success' => false,
-                'errors' => $ve->errors(),
-            ], 422);
+                'message' => $e->getMessage(),
+            ], 500);
+        }
+    }
+
+    public function matchBranchProductKey(Request $request, $branch_product_key = null)
+    {
+        try {
+            $key = $request->input('branch_product_key') ?? $branch_product_key;
+
+            if (empty($key) || !is_string($key)) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Validation error: The branch_product_key field is required.',
+                    'errors'  => [
+                        'branch_product_key' => ['The branch_product_key field is required and must be a valid string.']
+                    ],
+                ], 422);
+            }
+
+            $unit = EgsUnit::where('uuid', trim($key))->first();
+
+            if (!$unit) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'No matching EGS unit found for the provided branch_product_key.',
+                ], 404);
+            }
+
+            return response()->json([
+                'success'     => true,
+                'message'     => 'Branch product key matched successfully.',
+                'id'          => $unit->id,
+                'custom_id'   => $unit->custom_id,
+                'branch_name' => $unit->branch_name,
+                'vat_number'  => $unit->vat_number,
+                'data'        => [
+                    'id'          => $unit->id,
+                    'custom_id'   => $unit->custom_id,
+                    'branch_name' => $unit->branch_name,
+                    'vat_number'  => $unit->vat_number,
+                ],
+            ]);
+
         } catch (\Exception $e) {
             return response()->json([
                 'success' => false,

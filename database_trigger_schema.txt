@@ -1,0 +1,224 @@
+Table creation
+IF OBJECT_ID(N'[dbo].[ZATCA_INVOICE_MASTER]', N'U') IS NULL
+BEGIN
+    CREATE TABLE [dbo].[ZATCA_INVOICE_MASTER] (
+        [ID]                 BIGINT IDENTITY(1, 1) NOT NULL,
+
+        -- Document Identification
+        [Mdocnum]            VARCHAR(50) NOT NULL,
+        [Mdoctype]           VARCHAR(10) NOT NULL,            -- 'INV', 'RET', etc.
+        [Mrefnumber]         VARCHAR(50) NULL,                -- Reference invoice for Credit Notes
+
+        -- Date & Time
+        [Mtrxdate]           DATETIME NULL,
+        [MtrxdateA]          VARCHAR(20) NULL,                -- Formatted date string (DD/MM/YYYY)
+
+        -- Customer & Branch
+        [MsupcusName]        NVARCHAR(200) NULL,
+        [vatno]              VARCHAR(50) NULL,
+        [Mbranch]            VARCHAR(20) NULL,
+
+        -- Normalized Item Details
+        [Mitemname]          NVARCHAR(250) NOT NULL,
+        [SaleQty]            DECIMAL(18, 4) NOT NULL DEFAULT (0),  -- Standardized Sale Qty
+        [RetQty]             DECIMAL(18, 4) NOT NULL DEFAULT (0),  -- Standardized Return Qty
+        [UnitPrice]          DECIMAL(18, 4) NOT NULL DEFAULT (0),  -- Standardized NET Price (excl. VAT)
+        [GrossUnitPrice]     DECIMAL(18, 4) NULL,                 -- Raw price before VAT deduction
+        [VatRate]            DECIMAL(5, 4) NOT NULL DEFAULT (0.15),-- 15% (0.15)
+
+        -- Descriptions & Reasons
+        [Des]                NVARCHAR(500) NULL,
+        [remarks]            NVARCHAR(500) NULL,
+
+        -- ZATCA Compliance Columns (Initially NULL, updated upon verification)
+        [Invoice_qrcode]     VARCHAR(MAX) NULL,
+        [Invoice_hashkey]    VARCHAR(MAX) NULL,
+
+        -- System Audit Columns
+        [LastAction]         VARCHAR(10) NOT NULL DEFAULT ('INSERT'), -- 'INSERT' or 'UPDATE'
+        [CreatedAt]          DATETIME NOT NULL DEFAULT (GETDATE()),
+        [UpdatedAt]          DATETIME NULL,
+
+        CONSTRAINT [PK_ZATCA_INVOICE_MASTER] PRIMARY KEY CLUSTERED ([ID] ASC)
+    );
+
+    -- Unique composite constraint to prevent duplicates per line item
+    CREATE UNIQUE NONCLUSTERED INDEX [UX_ZATCA_INVOICE_MASTER_Item]
+        ON [dbo].[ZATCA_INVOICE_MASTER] ([Mdocnum], [Mdoctype], [Mitemname]);
+
+    -- Search index for unposted invoices
+    CREATE NONCLUSTERED INDEX [IX_ZATCA_INVOICE_MASTER_Status]
+        ON [dbo].[ZATCA_INVOICE_MASTER] ([Mdocnum], [Mdoctype])
+        INCLUDE ([Invoice_qrcode], [Invoice_hashkey], [Mtrxdate]);
+END;
+GO
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+-- =========================================================================
+-- UNIVERSAL AUTO-DEPLOYER FOR ZATCA SSOT TRIGGER (Fixed NVARCHAR(MAX))
+-- =========================================================================
+
+DECLARE @SaleCol NVARCHAR(50)   = N'0';
+DECLARE @RetCol NVARCHAR(50)    = N'0';
+DECLARE @BranchCol NVARCHAR(50) = N'NULL';
+DECLARE @IsVatIncluded INT      = 1;
+
+-- 1. Detect Sale Quantity Column
+IF COLUMNPROPERTY(OBJECT_ID('dbo.MasterTrx'), 'Msaleqty', 'ColumnId') IS NOT NULL
+BEGIN
+    SET @SaleCol = N'i.Msaleqty';
+    SET @IsVatIncluded = 1; -- Databases with Msaleqty typically include 15% VAT in Munitprice
+END
+ELSE IF COLUMNPROPERTY(OBJECT_ID('dbo.MasterTrx'), 'Outqty', 'ColumnId') IS NOT NULL
+    SET @SaleCol = N'i.Outqty';
+
+-- 2. Detect Return Quantity Column
+IF COLUMNPROPERTY(OBJECT_ID('dbo.MasterTrx'), 'Mretqty', 'ColumnId') IS NOT NULL
+    SET @RetCol = N'i.Mretqty';
+ELSE IF COLUMNPROPERTY(OBJECT_ID('dbo.MasterTrx'), 'Inqty', 'ColumnId') IS NOT NULL
+    SET @RetCol = N'i.Inqty';
+
+-- 4. Build trigger SQL safely using NVARCHAR(MAX) concatenation chunks
+DECLARE @TriggerSQL NVARCHAR(MAX) = N'';
+
+SET @TriggerSQL = @TriggerSQL + N'
+CREATE OR ALTER TRIGGER [dbo].[trg_MasterTrx_To_ZATCA_SSOT]
+ON [dbo].[MasterTrx]
+AFTER INSERT, UPDATE
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    IF TRIGGER_NESTLEVEL() > 1 OR NOT EXISTS (SELECT 1 FROM inserted)
+        RETURN;
+
+    DECLARE @IsVatIncludedInDb BIT = ' + CAST(@IsVatIncluded AS NVARCHAR(1)) + N';
+
+    ;WITH RawSource AS (
+        SELECT
+            LTRIM(RTRIM(CAST(i.Mdocnum AS VARCHAR(50)))) AS Mdocnum,
+            UPPER(LTRIM(RTRIM(COALESCE(CAST(i.Mdoctype AS VARCHAR(10)), ''INV'')))) AS Mdoctype,
+            CAST(i.Mrefnumber AS VARCHAR(50)) AS Mrefnumber,
+            i.Mtrxdate,
+            COALESCE(NULLIF(LTRIM(RTRIM(CAST(i.MtrxdateA AS VARCHAR(20)))), ''''), CONVERT(VARCHAR(10), i.Mtrxdate, 103)) AS MtrxdateA,
+            CAST(i.MsupcusName AS NVARCHAR(200)) AS MsupcusName,
+            CAST(i.vatno AS VARCHAR(50)) AS vatno,
+            CAST(' + @BranchCol + N' AS VARCHAR(20)) AS Mbranch,
+            LTRIM(RTRIM(COALESCE(NULLIF(CAST(i.Mitemname AS NVARCHAR(250)), N''''), N''General Item''))) AS Mitemname,
+            CAST(COALESCE(' + @SaleCol + N', 0) AS DECIMAL(18, 4)) AS SaleQty,
+            CAST(COALESCE(' + @RetCol + N', 0) AS DECIMAL(18, 4))   AS RetQty,
+            CAST(COALESCE(i.Munitprice, 0) AS DECIMAL(18, 4)) AS RawUnitPrice,
+            CASE
+                WHEN @IsVatIncludedInDb = 1
+                THEN CAST(ROUND(COALESCE(i.Munitprice, 0) / 1.15, 2) AS DECIMAL(18, 4))
+                ELSE CAST(COALESCE(i.Munitprice, 0) AS DECIMAL(18, 4))
+            END AS NormalizedUnitPrice,
+            CAST(i.Des AS NVARCHAR(500)) AS Des,
+            CAST(i.remarks AS NVARCHAR(500)) AS remarks
+        FROM inserted i
+        WHERE i.Mdocnum IS NOT NULL AND LTRIM(RTRIM(CAST(i.Mdocnum AS VARCHAR(50)))) <> ''''
+    ),';
+
+SET @TriggerSQL = @TriggerSQL + N'
+    NormalizedSource AS (
+        SELECT
+            Mdocnum,
+            Mdoctype,
+            MAX(Mrefnumber) AS Mrefnumber,
+            MAX(Mtrxdate) AS Mtrxdate,
+            MAX(MtrxdateA) AS MtrxdateA,
+            MAX(MsupcusName) AS MsupcusName,
+            MAX(vatno) AS vatno,
+            MAX(Mbranch) AS Mbranch,
+            Mitemname,
+            SUM(SaleQty) AS SaleQty,
+            SUM(RetQty) AS RetQty,
+            MAX(RawUnitPrice) AS RawUnitPrice,
+            MAX(NormalizedUnitPrice) AS NormalizedUnitPrice,
+            MAX(Des) AS Des,
+            MAX(remarks) AS remarks
+        FROM RawSource
+        GROUP BY Mdocnum, Mdoctype, Mitemname
+    )
+    MERGE [dbo].[ZATCA_INVOICE_MASTER] AS target
+    USING NormalizedSource AS source
+       ON target.[Mdocnum]   = source.[Mdocnum]
+      AND target.[Mdoctype]  = source.[Mdoctype]
+      AND target.[Mitemname] = source.[Mitemname]
+    WHEN MATCHED THEN
+        UPDATE SET
+            target.[Mrefnumber]     = source.[Mrefnumber],
+            target.[Mtrxdate]       = source.[Mtrxdate],
+            target.[MtrxdateA]      = source.[MtrxdateA],
+            target.[MsupcusName]    = source.[MsupcusName],
+            target.[vatno]          = source.[vatno],
+            target.[Mbranch]        = source.[Mbranch],
+            target.[SaleQty]        = source.[SaleQty],
+            target.[RetQty]         = source.[RetQty],
+            target.[GrossUnitPrice] = source.[RawUnitPrice],
+            target.[UnitPrice]      = source.[NormalizedUnitPrice],
+            target.[Des]            = source.[Des],
+            target.[remarks]        = source.[remarks],
+            target.[LastAction]     = ''UPDATE'',
+            target.[UpdatedAt]      = GETDATE(),';
+
+SET @TriggerSQL = @TriggerSQL + N'
+            target.[Invoice_qrcode] = CASE
+                WHEN (target.[UnitPrice] <> source.[NormalizedUnitPrice]
+                   OR target.[SaleQty] <> source.[SaleQty]
+                   OR target.[RetQty] <> source.[RetQty])
+                THEN NULL
+                ELSE target.[Invoice_qrcode]
+            END,
+            target.[Invoice_hashkey] = CASE
+                WHEN (target.[UnitPrice] <> source.[NormalizedUnitPrice]
+                   OR target.[SaleQty] <> source.[SaleQty]
+                   OR target.[RetQty] <> source.[RetQty])
+                THEN NULL
+                ELSE target.[Invoice_hashkey]
+            END
+    WHEN NOT MATCHED BY TARGET THEN
+        INSERT (
+            [Mdocnum], [Mdoctype], [Mrefnumber], [Mtrxdate], [MtrxdateA],
+            [MsupcusName], [vatno], [Mbranch], [Mitemname],
+            [SaleQty], [RetQty], [UnitPrice], [GrossUnitPrice],
+            [VatRate], [Des], [remarks], [Invoice_qrcode], [Invoice_hashkey],
+            [LastAction], [CreatedAt]
+        )
+        VALUES (
+            source.[Mdocnum], source.[Mdoctype], source.[Mrefnumber], source.[Mtrxdate], source.[MtrxdateA],
+            source.[MsupcusName], source.[vatno], source.[Mbranch], source.[Mitemname],
+            source.[SaleQty], source.[RetQty], source.[NormalizedUnitPrice], source.[RawUnitPrice],
+            0.15, source.[Des], source.[remarks], NULL, NULL,
+            ''INSERT'', GETDATE()
+        );
+END;';
+
+-- 5. Compile trigger and report exact status
+BEGIN TRY
+    EXEC sp_executesql @TriggerSQL;
+    PRINT 'Trigger [trg_MasterTrx_To_ZATCA_SSOT] created successfully with detected columns:';
+    PRINT '   - Sale Qty Column  : ' + @SaleCol;
+    PRINT '   - Return Qty Column: ' + @RetCol;
+    PRINT '   - Branch Column    : ' + @BranchCol;
+    PRINT '   - Vat Inclusive    : ' + CASE WHEN @IsVatIncluded = 1 THEN 'YES (deducting 15%)' ELSE 'NO (actual price)' END;
+END TRY
+BEGIN CATCH
+    PRINT 'Failed to create trigger: ' + ERROR_MESSAGE();
+    THROW;
+END CATCH;
+GO
+
